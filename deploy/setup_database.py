@@ -99,8 +99,36 @@ def initialize_db(admin_user, admin_pass):
         print("Database initialized successfully.")
 
 if __name__ == "__main__":
+    import secrets
+    import getpass
+    
     parser = argparse.ArgumentParser(description="DMR NCS System Database Initialization Utility")
     parser.add_argument("--admin", type=str, default="admin", help="Admin username")
-    parser.add_argument("--password", type=str, default="vulcan3efz!", help="Admin secure password")
+    parser.add_argument("--password", type=str, default=None, help="Admin secure password (if omitted, prompts or generates a secure random password)")
     args = parser.parse_args()
-    initialize_db(args.admin, args.password)
+    
+    password = args.password
+    if not password:
+        if sys.stdin.isatty():
+            print("No admin password specified. Interactive terminal detected.")
+            try:
+                password = getpass.getpass("Enter secure admin password: ")
+                if not password or len(password) < 6:
+                    print("Invalid password length. Must be at least 6 characters.")
+                    sys.exit(1)
+            except Exception:
+                password = None
+                
+        if not password:
+            # Generate a strong high-entropy password
+            password = secrets.token_hex(10) # 20 characters secure hex
+            print("=" * 64)
+            print(" SECURITY WARNING: NO ADMINISTRATIVE PASSWORD SPECIFIED")
+            print(" Generating a secure, high-entropy administrative password:")
+            print(f" USERNAME: {args.admin}")
+            print(f" PASSWORD: {password}")
+            print("=" * 64)
+            print("Please save these credentials safely. They are initialized only once.")
+            print("=" * 64)
+            
+    initialize_db(args.admin, password)

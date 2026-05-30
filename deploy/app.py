@@ -63,26 +63,69 @@ def log_audit_action(action, target="", status="success", username=None):
 def parse_mmdvm_logs_job():
     """
     Parse the MMDVM logs to populate the Heard database, Station records and current activity.
-    Processes today's log file as configured.
+    Processes today's log file using a seek offset stored in the Settings database to capture lines exactly once.
     """
     with app.app_context():
         today_str = datetime.datetime.now(IST).strftime("%Y-%m-%d")
-        log_file_path = os.path.join(Config.LOG_DIR, f"MMDVM_Bridge-{today_str}.log")
+        log_file_name = f"MMDVM_Bridge-{today_str}.log"
+        log_file_path = os.path.join(Config.LOG_DIR, log_file_name)
         
         if not os.path.exists(log_file_path):
             return # No active logs for today yet
             
         try:
-            with open(log_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                lines = f.readlines()
+            # Persistent state tracking from Settings database
+            saved_file = Setting.query.filter_by(key="log_parser_filename").first()
+            saved_offset = Setting.query.filter_by(key="log_parser_offset").first()
+            
+            offset = 0
+            if saved_file and saved_file.value == log_file_name:
+                if saved_offset:
+                    try:
+                        offset = int(saved_offset.value)
+                    except ValueError:
+                        offset = 0
+            else:
+                # File rotated to a new day or first time running.
+                if not saved_file:
+                    saved_file = Setting(key="log_parser_filename", value=log_file_name, group="system_log")
+                    db.session.add(saved_file)
+                else:
+                    saved_file.value = log_file_name
                 
-            for line in lines[-100:]:  # Process latest 100 log lines to keep database fresh
+                if not saved_offset:
+                    saved_offset = Setting(key="log_parser_offset", value="0", group="system_log")
+                    db.session.add(saved_offset)
+                else:
+                    saved_offset.value = "0"
+                db.session.commit()
+                offset = 0
+                
+            file_size = os.path.getsize(log_file_path)
+            if file_size < offset:
+                # File was truncated/cleared
+                offset = 0
+                
+            if file_size == offset:
+                return # No new logs written
+                
+            with open(log_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                f.seek(offset)
+                new_data = f.read()
+                new_offset = f.tell()
+                
+            if not new_data:
+                return
+                
+            # Parse only newly appended logs
+            lines = new_data.splitlines()
+            for line in lines:
+                if not line.strip():
+                    continue
                 # Log parsing logic for TX Voice Headers and transmissions
                 # Matches: "received network voice header from KF0VOX to TG 91"
                 if "received network voice header from" in line:
                     parts = line.strip().split(" ")
-                    # ... processing extraction ...
-                    # Find index of 'from', 'to', 'TG'
                     try:
                         from_idx = parts.index("from")
                         sub_parts = parts[from_idx+1:]
@@ -98,7 +141,6 @@ def parse_mmdvm_logs_job():
                 # Matches: "Begin TX: src=4040444 rpt=404044418 dst=404 slot=2 cc=1 metadata=VU3EFZ"
                 elif "Begin TX" in line:
                     try:
-                        # Extract key parameters
                         src = ""
                         dst = ""
                         call = ""
@@ -114,35 +156,103 @@ def parse_mmdvm_logs_job():
                             process_transmission(call, int(dst), airtime=4, dmr_id=src)
                     except Exception:
                         continue
+            
+            # Save progress position offset to disk
+            saved_offset.value = str(new_offset)
+            db.session.commit()
+            
         except Exception as e:
             db.session.rollback()
             event = Event(event_type="log_parser", message=f"Log parse error: {str(e)}", severity="error")
             db.session.add(event)
             db.session.commit()
 
-def process_transmission(callsign, talkgroup, airtime, dmr_id=""):
-    # Lookup/Create Station
-    station = Station.query.filter_by(callsign=callsign).first()
+def lookup_radio_metadata(callsign):
+    """
+    Look up station metadata from RadioID.net and BrandMeister user databases.
+    Returns dictionary containing: dmr_id, name, country, state, city
+    """
+    import urllib.request
+    import json
+    import ssl
+    
     country = determine_country(callsign)
+    result = {
+        "dmr_id": None,
+        "name": "",
+        "country": country,
+        "state": "",
+        "city": ""
+    }
+    
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        # Pull live record from database.radioid.net User Endpoint
+        url = f"https://database.radioid.net/api/v1/user?callsign={callsign.upper()}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) dmr-ncs-platform/1.0"})
+        
+        with urllib.request.urlopen(req, context=ctx, timeout=2) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode('utf-8'))
+                if data and "results" in data and len(data["results"]) > 0:
+                    user_data = data["results"][0]
+                    result["dmr_id"] = str(user_data.get("dmr_id", ""))
+                    result["name"] = f"{user_data.get('fname', '')} {user_data.get('lname', '')}".strip()
+                    result["country"] = user_data.get("country", country)
+                    result["state"] = user_data.get("state", "")
+                    result["city"] = user_data.get("city", "")
+                    return result
+    except Exception:
+        # Fallback to Brandmeister user registry on failure
+        try:
+            url_bm = f"https://api.brandmeister.network/v2/user/{callsign.upper()}"
+            req_bm = urllib.request.Request(url_bm, headers={"User-Agent": "Mozilla/5.0 dmr-ncs-platform/1.0"})
+            with urllib.request.urlopen(req_bm, context=ctx, timeout=2) as response:
+                if response.status == 200:
+                    data = json.loads(response.read().decode('utf-8'))
+                    if data:
+                        result["name"] = data.get("name", "")
+                        result["country"] = data.get("country", country)
+                        return result
+        except Exception:
+            pass
+            
+    return result
+
+def process_transmission(callsign, talkgroup, airtime, dmr_id=""):
+    # Lookup/Create Station with DMR metadata enrichment
+    station = Station.query.filter_by(callsign=callsign).first()
+    metadata = lookup_radio_metadata(callsign)
+    country = metadata["country"] or determine_country(callsign)
+    name = metadata["name"]
+    final_dmr_id = dmr_id or metadata["dmr_id"] or f"404{datetime.datetime.now().microsecond}"
     
     if not station:
         station = Station(
-            dmr_id=dmr_id or f"404{datetime.datetime.now().microsecond}",
+            dmr_id=final_dmr_id,
             callsign=callsign,
             country=country,
             first_heard=datetime.datetime.utcnow(),
             last_heard=datetime.datetime.utcnow(),
             total_airtime=airtime,
             total_tx=1,
-            most_used_tg=talkgroup
+            most_used_tg=talkgroup,
+            notes=f"Name: {name}. State/City: {metadata['state']} {metadata['city']}".strip() if (name or metadata['state']) else None
         )
         db.session.add(station)
     else:
         station.total_airtime += airtime
         station.total_tx += 1
         station.last_heard = datetime.datetime.utcnow()
-        if dmr_id:
-            station.dmr_id = dmr_id
+        if final_dmr_id:
+            station.dmr_id = final_dmr_id
+        if country and country != "Global / DX":
+            station.country = country
+        if name and not station.notes:
+            station.notes = f"Name: {name}. State/City: {metadata['state']} {metadata['city']}".strip()
         db.session.add(station)
 
     # Manage Net participation if Net is active
@@ -221,56 +331,49 @@ def determine_country(callsign):
     else:
         return "Global / DX"
 
-def cron_automated_net_schedule():
+def auto_start_net_saturday():
     """
-    APScheduler job to automate weekly World-wide Net TG91 on Saturdays 21:30 IST.
-    Closes the net automatically Sundays 03:00 IST.
+    Automated net initializer triggered precisely on Saturday at 21:30 IST via APScheduler.
     """
     with app.app_context():
         now_ist = datetime.datetime.now(IST)
-        # Saturday is weekday 5 (Monday=0, Tuesday=1 ... Friday=4, Saturday=5, Sunday=6)
-        # Sunday is weekday 6
-        
-        # Check Saturday 21:30 Autostart
-        if now_ist.weekday() == 5 and now_ist.hour == 21 and now_ist.minute >= 30:
-            existing_active = Net.query.filter_by(status='active').first()
-            if not existing_active:
-                # Trigger Net Creation
-                name = f"Worldwide TG91 Net - {now_ist.strftime('%d-%b-%Y')}"
-                net = Net(
-                    name=name,
-                    status='active',
-                    talkgroup=91,
-                    start_time=datetime.datetime.utcnow(),
-                    participant_count=0,
-                    country_count=0
-                )
-                db.session.add(net)
-                db.session.commit()
-                
-                # Execute tuner script to switch to TG 91
-                tune_tg_radio(91)
-                
-                event = Event(event_type="scheduler", message=f"Automated Net Session '{name}' started and active, Talkgroup 91 tuned.", severity="info")
-                db.session.add(event)
-                db.session.commit()
-                
-        # Check Sunday 03:00 Autoclose
-        elif now_ist.weekday() == 6 and now_ist.hour == 3 and now_ist.minute >= 0:
-            active_net = Net.query.filter_by(status='active').first()
-            if active_net:
-                active_net.status = 'closed'
-                active_net.end_time = datetime.datetime.utcnow()
-                td = active_net.end_time - active_net.start_time
-                active_net.duration = int(td.total_seconds() / 60)
-                
-                # Generate files/reports automatically
-                # Archive activities ...
-                db.session.commit()
-                
-                event = Event(event_type="scheduler", message=f"Automated Net Session '{active_net.name}' successfully closed and archived.", severity="info")
-                db.session.add(event)
-                db.session.commit()
+        existing_active = Net.query.filter_by(status='active').first()
+        if not existing_active:
+            name = f"Worldwide TG91 Net - {now_ist.strftime('%d-%b-%Y')}"
+            net = Net(
+                name=name,
+                status='active',
+                talkgroup=91,
+                start_time=datetime.datetime.utcnow(),
+                participant_count=0,
+                country_count=0
+            )
+            db.session.add(net)
+            db.session.commit()
+            
+            # Tune bridge to TG 91
+            tune_tg_radio(91)
+            
+            event = Event(event_type="scheduler", message=f"Automated net session '{name}' initiated on Saturday schedule.", severity="info")
+            db.session.add(event)
+            db.session.commit()
+
+def auto_close_net_sunday():
+    """
+    Automated net sign-off triggered precisely on Sunday at 03:00 IST via APScheduler.
+    """
+    with app.app_context():
+        active_net = Net.query.filter_by(status='active').first()
+        if active_net:
+            active_net.status = 'closed'
+            active_net.end_time = datetime.datetime.utcnow()
+            td = active_net.end_time - active_net.start_time
+            active_net.duration = int(td.total_seconds() / 60)
+            db.session.commit()
+            
+            event = Event(event_type="scheduler", message=f"Automated net session '{active_net.name}' archived on Sunday schedule.", severity="info")
+            db.session.add(event)
+            db.session.commit()
 
 def tune_tg_radio(tg):
     """
@@ -307,11 +410,118 @@ def sync_ab_info(tg):
     except Exception as e:
         print(f"Failed to update ABInfo: {e}")
 
-# Start APScheduler
+def aprs_is_listener():
+    """
+    Background worker that connects to rotate.aprs2.net:14580, logs in as guest,
+    streams live APRS-IS positional packets, extracts beacon locations, and populates the Map.
+    """
+    import socket
+    import re
+    import time
+    
+    server_host = "rotate.aprs2.net"
+    server_port = 14580
+    callsign = "N0CALL"
+    passcode = "-1"
+    filter_expr = "t/p" # Beacons from position-reporting systems
+    
+    while True:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(30)
+            s.connect((server_host, server_port))
+            
+            login_str = f"user {callsign} pass {passcode} vers dmr-ncs-console 1.0 filter {filter_expr}\r\n"
+            s.sendall(login_str.encode('utf-8'))
+            
+            buffer = ""
+            while True:
+                try:
+                    data = s.recv(4096).decode('utf-8', errors='ignore')
+                except socket.timeout:
+                    break
+                if not data:
+                    break
+                buffer += data
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if line.startswith("#") or not line:
+                        continue
+                     
+                    # Parse standard APRS coordinate packet:
+                    # e.g., VU3EFZ-9>APRS,TCPIP*,qAC,T2INDIA:!1258.17N/07735.46E#PHG5130/DMR hotspot
+                    pos_match = re.search(r'([A-Z0-9\-]+)>.*?:[:@=]?(?:\d{6}[zh])?(\d{2})(\d{2}\.\d{2})([NS])([\/\\_])(\d{3})(\d{2}\.\d{2})([EW])', line)
+                    if pos_match:
+                        call = pos_match.group(1)
+                        lat_deg = float(pos_match.group(2))
+                        lat_min = float(pos_match.group(3))
+                        lat_dir = pos_match.group(4)
+                        sym_table = pos_match.group(5)
+                        lon_deg = float(pos_match.group(6))
+                        lon_min = float(pos_match.group(7))
+                        lon_dir = pos_match.group(8)
+                        
+                        latitude = lat_deg + (lat_min / 60.0)
+                        if lat_dir == 'S':
+                            latitude = -latitude
+                        longitude = lon_deg + (lon_min / 60.0)
+                        if lon_dir == 'W':
+                            longitude = -longitude
+                            
+                        # Parse symbol and comment details
+                        idx = line.find(f"{lon_dir}")
+                        symbol = "[-]"
+                        comment = "APRS-IS Live Node"
+                        if idx != -1 and idx + 1 < len(line):
+                            symbol = sym_table + line[idx+1]
+                            comment = line[idx+2:].strip()[:200] if idx + 2 < len(line) else "APRS-IS Live Node"
+                            
+                        with app.app_context():
+                            record = Aprs.query.filter_by(callsign=call).first()
+                            if not record:
+                                record = Aprs(callsign=call)
+                            
+                            record.latitude = latitude
+                            record.longitude = longitude
+                            record.timestamp = datetime.datetime.utcnow()
+                            record.altitude = 0.0
+                            record.speed = 0.0
+                            record.heading = 0
+                            record.comment = comment if comment else "APRS-IS Live Station"
+                            record.symbol = symbol
+                            
+                            db.session.add(record)
+                            db.session.commit()
+                            
+                            # Limit total history inside SQLite to prevent disk inflation
+                            count = Aprs.query.count()
+                            if count > 100:
+                                oldest = Aprs.query.order_by(Aprs.timestamp.asc()).first()
+                                if oldest:
+                                    db.session.delete(oldest)
+                                    db.session.commit()
+                time.sleep(0.01)
+        except Exception as e:
+            print("[APRS-IS Listener Error] Reconnecting in 15 seconds: ", e)
+        time.sleep(15)
+
+def start_aprs_is_listener():
+    import threading
+    t = threading.Thread(target=aprs_is_listener, daemon=True)
+    t.start()
+    print("[APRS-IS Ingestion Engine] Client daemon thread is running in the background.")
+
+# Start APScheduler with native cron automation triggers
 scheduler = BackgroundScheduler()
 scheduler.add_job(parse_mmdvm_logs_job, 'interval', seconds=5)
-scheduler.add_job(cron_automated_net_schedule, 'cron', hour='*', minute='*') # Checked every minute
+
+# Strictly trigger on Saturdays 21:30 IST and Sunday 03:00 IST directly via scheduler definitions
+scheduler.add_job(auto_start_net_saturday, 'cron', day_of_week='sat', hour=21, minute=30, timezone=IST)
+scheduler.add_job(auto_close_net_sunday, 'cron', day_of_week='sun', hour=3, minute=0, timezone=IST)
+
 scheduler.start()
+start_aprs_is_listener()
 
 
 # --- HTTP API ROUTE CONTROLLERS ---
