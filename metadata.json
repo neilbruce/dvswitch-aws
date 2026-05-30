@@ -1,0 +1,6 @@
+{
+  "name": "DMR Network Control Station",
+  "description": "Complete production-ready DMR Network Control Station platform for DVSwitch and BrandMeister including live heard tracking, APRS, net management, and automated scheduling.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

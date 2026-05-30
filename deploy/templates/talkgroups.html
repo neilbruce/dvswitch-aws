@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <title>Talkgroup Directory & Router | Network Control Station</title>
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+    <!-- Bootstrap 5 CSS (Slate Theme Match) -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- DataTables Bootstrap 5 CSS -->
+    <link href="https://cdn.datatables.net/1.13.7/css/dataTables.bootstrap5.min.css" rel="stylesheet">
+    <!-- Lucide Icons -->
+    <script src="https://cdn.jsdelivr.net/npm/lucide@0.321.0/dist/umd/lucide.min.js"></script>
+    
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-color: #1e293b;
+            --border-color: #334155;
+            --hover-color: #1e293b;
+            --accent-primary: #3b82f6;
+            --accent-green: #10b981;
+            --text-main: #f1f5f9;
+            --text-muted: #94a3b8;
+            --font-sans: 'Inter', system-ui, sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+            --font-display: 'Space Grotesk', sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: var(--font-sans);
+            padding: 2rem 1rem;
+            min-height: 100vh;
+        }
+
+        h1, h2, h3, .brand-font {
+            font-family: var(--font-display);
+        }
+
+        .ncs-card {
+            background-color: var(--card-color);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+        }
+
+        .tg-badge {
+            font-family: var(--font-mono);
+            font-weight: 700;
+            background-color: #1e293b;
+            color: #3b82f6;
+            border: 1px solid #3b82f6;
+            padding: 0.35rem 0.75rem;
+            border-radius: 0.5rem;
+            font-size: 1.1rem;
+        }
+
+        /* Customize Form Inputs to Slate theme */
+        .form-control, .form-select {
+            background-color: #0f172a !important;
+            border: 1px solid var(--border-color) !important;
+            color: var(--text-main) !important;
+        }
+
+        .form-control:focus, .form-select:focus {
+            border-color: var(--accent-primary) !important;
+            box-shadow: 0 0 0 0.25rem rgba(59, 130, 246, 0.25) !important;
+        }
+
+        .form-control::placeholder {
+            color: #64748b;
+        }
+
+        /* Customized DataTables styling for Cosmic Slate */
+        table.dataTable {
+            border-collapse: separate !important;
+            border-spacing: 0 !important;
+            color: var(--text-main) !important;
+            background-color: var(--card-color) !important;
+        }
+
+        table.dataTable thead tr {
+            background-color: #0f172a !important;
+        }
+
+        table.dataTable thead th {
+            border-bottom: 2px solid var(--border-color) !important;
+            color: var(--text-main) !important;
+            font-family: var(--font-display);
+            text-transform: uppercase;
+            font-size: 0.85rem;
+            letter-spacing: 0.05em;
+            padding: 1rem !important;
+        }
+
+        table.dataTable tbody tr {
+            background-color: var(--card-color) !important;
+            border-bottom: 1px solid var(--border-color) !important;
+        }
+
+        table.dataTable tbody tr:hover {
+            background-color: #334155 !important;
+        }
+
+        table.dataTable tbody td {
+            border-bottom: 1px solid var(--border-color) !important;
+            padding: 1rem !important;
+            vertical-align: middle;
+        }
+
+        .dataTables_wrapper .dataTables_paginate .paginate_button {
+            color: var(--text-main) !important;
+            background: transparent !important;
+            border: 1px solid var(--border-color) !important;
+            border-radius: 0.375rem !important;
+            margin: 0 2px !important;
+        }
+
+        .dataTables_wrapper .dataTables_paginate .paginate_button.current, 
+        .dataTables_wrapper .dataTables_paginate .paginate_button.current:hover {
+            background: var(--accent-primary) !important;
+            border-color: var(--accent-primary) !important;
+            color: #fff !important;
+        }
+
+        .page-item.active .page-link {
+            background-color: var(--accent-primary) !important;
+            border-color: var(--accent-primary) !important;
+        }
+
+        .page-link {
+            background-color: #0f172a !important;
+            border-color: var(--border-color) !important;
+            color: var(--text-main) !important;
+        }
+
+        .page-link:hover {
+            background-color: var(--border-color) !important;
+            color: var(--text-main) !important;
+        }
+
+        .btn-tune {
+            background-color: var(--accent-primary);
+            color: #ffffff;
+            font-weight: 600;
+            border: none;
+            padding: 0.4rem 0.9rem;
+            border-radius: 0.5rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            transition: all 0.2s ease;
+        }
+
+        .btn-tune:hover:not(:disabled) {
+            background-color: #2563eb;
+            transform: translateY(-1px);
+        }
+
+        .btn-tune:disabled {
+            background-color: #475569;
+            color: #94a3b8;
+            cursor: not-allowed;
+        }
+
+        .tuned-indicator {
+            background-color: rgba(16, 185, 129, 0.15);
+            color: var(--accent-green);
+            border: 1px solid var(--accent-green);
+            font-weight: 700;
+            padding: 0.4rem 0.9rem;
+            border-radius: 0.5rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        .status-pill {
+            background-color: #0f172a;
+            border: 1px solid var(--border-color);
+            border-radius: 0.75rem;
+            padding: 0.75rem 1.25rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .text-mono {
+            font-family: var(--font-mono);
+        }
+    </style>
+</head>
+<body>
+
+<div class="container-fluid max-w-7xl mx-auto">
+    <!-- Header Block -->
+    <div class="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center gap-4 mb-5 border-bottom border-secondary border-opacity-25 pb-4">
+        <div>
+            <div class="d-flex align-items-center gap-2 mb-2">
+                <span class="badge bg-primary text-uppercase font-bold tracking-wider px-2 py-1" style="font-size: 0.75rem;">Platform Module</span>
+            </div>
+            <h1 class="text-3xl font-bold tracking-tight text-white mb-1">Talkgroup Directory & Gateway Controls</h1>
+            <p class="text-sm text-secondary-emphasis mb-0">Search BrandMeister & DVSwitch talkgroup nodes. Manage active MMDVM bridge routing logs securely.</p>
+        </div>
+        
+        <!-- Live Status Info Controls -->
+        <div class="d-flex flex-wrap gap-2">
+            <div class="status-pill">
+                <div class="bg-primary bg-opacity-25 p-2 rounded text-primary d-flex align-items-center justify-content-center">
+                    <i data-lucide="radio" class="w-5 h-5"></i>
+                </div>
+                <div>
+                    <div class="text-xs text-muted">CURRENT GATEWAY TG</div>
+                    <div class="font-mono font-bold text-white fs-5" id="current-tg-indicator">
+                        TG {{ current_tg }}
+                    </div>
+                </div>
+            </div>
+
+            <div class="status-pill">
+                <div class="bg-success bg-opacity-25 p-2 rounded text-success d-flex align-items-center justify-content-center">
+                    <i data-lucide="shield" class="w-5 h-5"></i>
+                </div>
+                <div>
+                    <div class="text-xs text-muted">AUTHORIZATION ROLE</div>
+                    <div class="font-bold text-white fs-6" id="auth-role-indicator">
+                        {% if current_user.is_authenticated %}
+                            {{ current_user.roles[0].name if current_user.roles else "User" }} ({{ current_user.username }})
+                        {% else %}
+                            READONLY (Observer)
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Live Status / Tune Logs Alerts Area -->
+    <div id="alert-container"></div>
+
+    <!-- Advanced Search Filters Box -->
+    <div class="ncs-card">
+        <div class="d-flex align-items-center gap-2 mb-4">
+            <i data-lucide="sliders-horizontal" class="text-primary w-5 h-5"></i>
+            <h3 class="fs-5 m-0 text-white">Multi-Column Advanced Filters</h3>
+        </div>
+        <div class="row g-3">
+            <div class="col-md-3">
+                <label class="form-label text-xs text-muted text-uppercase tracking-wider">TG Region</label>
+                <select id="filter-region" class="form-select select-field">
+                    <option value="">All Regions</option>
+                    {% for region in regions %}
+                    <option value="{{ region }}">{{ region }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label text-xs text-muted text-uppercase tracking-wider">Language</label>
+                <select id="filter-language" class="form-select select-field">
+                    <option value="">All Languages</option>
+                    {% for lang in languages %}
+                    <option value="{{ lang }}">{{ lang }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label text-xs text-muted text-uppercase tracking-wider">Category</label>
+                <select id="filter-category" class="form-select select-field">
+                    <option value="">All Categories</option>
+                    {% for cat in categories %}
+                    <option value="{{ cat }}">{{ cat }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label class="form-label text-xs text-muted text-uppercase tracking-wider">Country Location</label>
+                <select id="filter-country" class="form-select select-field">
+                    <option value="">All Countries</option>
+                    {% for country in countries %}
+                    <option value="{{ country }}">{{ country }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <!-- DataTables Table Core Card -->
+    <div class="ncs-card p-0 overflow-hidden">
+        <div class="p-4 border-b border-secondary border-opacity-10 d-flex justify-content-between align-items-center bg-dark bg-opacity-20">
+            <div class="d-flex align-items-center gap-2">
+                <i data-lucide="database" class="text-primary w-5 h-5"></i>
+                <h3 class="fs-5 m-0 text-white">DMR Talkgroup Database Directory</h3>
+            </div>
+            <!-- Quick reset button -->
+            <button id="btn-reset-filters" class="btn btn-sm btn-outline-secondary d-flex align-items-center gap-1 text-xs">
+                <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
+                Reset Fields
+            </button>
+        </div>
+
+        <div class="p-4 table-responsive">
+            <table id="talkgroups-table" class="table table-dark table-hover w-100 mb-0">
+                <thead>
+                    <tr>
+                        <th style="width: 15%">TG Number</th>
+                        <th style="width: 20%">Channel Name</th>
+                        <th style="width: 15%">Country</th>
+                        <th style="width: 12%">Region</th>
+                        <th style="width: 13%">Category</th>
+                        <th style="width: 12%">Language</th>
+                        <th style="width: 25%">Description</th>
+                        <th style="width: 13%; text-align: center;">Controls</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for tg in talkgroups %}
+                    <tr id="tg-row-{{ tg.number }}" class="align-middle">
+                        <td>
+                            <span class="tg-badge">TG {{ tg.number }}</span>
+                        </td>
+                        <td class="font-bold text-white">{{ tg.name }}</td>
+                        <td>
+                            <span class="d-flex align-items-center gap-1.5">
+                                <i data-lucide="globe-2" class="w-4 h-4 text-secondary"></i>
+                                {{ tg.country }}
+                            </span>
+                        </td>
+                        <td>{{ tg.region }}</td>
+                        <td>
+                            <span class="badge bg-secondary bg-opacity-25 text-primary-emphasis border border-primary border-opacity-10 rounded">
+                                {{ tg.category }}
+                            </span>
+                        </td>
+                        <td>{{ tg.language }}</td>
+                        <td class="text-muted text-sm">{{ tg.description or "No description provided." }}</td>
+                        <td class="text-center">
+                            {% if current_tg == tg.number %}
+                            <div class="tuned-indicator" id="indicator-{{ tg.number }}">
+                                <i data-lucide="check" class="w-4 h-4"></i>
+                                TUNED
+                            </div>
+                            {% else %}
+                            <button class="btn-tune" id="btn-tune-{{ tg.number }}" onclick="triggerGatewayTune({{ tg.number }})">
+                                <i data-lucide="chevron-right" class="w-4 h-4"></i>
+                                SWITCH TG
+                            </button>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Modal login popups if user needs authorization -->
+{% if not current_user.is_authenticated %}
+<div class="modal fade" id="authModal" tabindex="-1" aria-labelledby="authModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content text-white" style="background-color: var(--card-color); border: 1px solid var(--border-color)">
+            <div class="modal-header border-secondary border-opacity-20">
+                <h5 class="modal-title font-bold text-white d-flex align-items-center gap-2" id="authModalLabel">
+                    <i data-lucide="lock" class="text-primary w-5 h-5"></i>
+                    Administrator Verification Required
+                </h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <form id="ajax-login-form">
+                <div class="modal-body space-y-4 py-4">
+                    <p class="text-sm text-secondary-emphasis">Standard observer security rules apply. Verify administrative operator credentials to tune transmitter frequencies.</p>
+                    <div class="mb-3">
+                        <label class="form-label text-xs text-uppercase tracking-wider text-muted">Operator Username</label>
+                        <input type="text" id="login-username" class="form-control" placeholder="admin" required value="admin">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label text-xs text-uppercase tracking-wider text-muted">Access Password</label>
+                        <input type="password" id="login-password" class="form-control" placeholder="••••••••" required value="vulcan3efz!">
+                    </div>
+                    <div id="login-error-alert" class="alert alert-danger d-none text-sm py-2"></div>
+                </div>
+                <div class="modal-footer border-secondary border-opacity-20">
+                    <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary font-semibold px-4 d-flex align-items-center gap-1.5">
+                        <i data-lucide="unlock" class="w-4 h-4"></i>
+                        Authenticate Code
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<!-- SCRIPT SUITE -->
+<!-- jQuery -->
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<!-- Bootstrap 5 HTML Bundle -->
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<!-- DataTables Engine Core -->
+<script src="https://cdn.jsdelivr.net/npm/jquery.dataTables@1.13.7/js/jquery.dataTables.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.7/js/dataTables.bootstrap5.min.js"></script>
+
+<script>
+    // CSRF configuration for ajax transactions
+    $.ajaxSetup({
+        headers: {
+            'X-CSRFToken': $('meta[name="csrf-token"]').attr('content')
+        }
+    });
+
+    // Initialize Lucide SVGs
+    lucide.createIcons();
+
+    let table;
+    const isLoggedIn = {% if current_user.is_authenticated %}true{% else %}false{% endif %};
+    let currentTunedTg = {{ current_tg }};
+
+    $(document).ready(function() {
+        // Initialize DataTables engine
+        table = $('#talkgroups-table').DataTable({
+            scrollX: false,
+            pageLength: 10,
+            lengthMenu: [5, 10, 25, 50],
+            language: {
+                searchPlaceholder: "Search tables...",
+                search: "",
+                paginate: {
+                    previous: "<i data-lucide='chevron-left' class='w-4 h-5'></i>",
+                    next: "<i data-lucide='chevron-right' class='w-4 h-5'></i>"
+                }
+            },
+            drawCallback: function() {
+                // Re-instantiate Icons inside table after draws/paginations
+                lucide.createIcons();
+            },
+            dom: '<"d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-3 mb-3"f l>rtip'
+        });
+
+        // Tidy search form layouts
+        $('.dataTables_filter input').addClass('form-control').attr('placeholder', 'Search talkgroups table...');
+        $('.dataTables_length select').addClass('form-select');
+
+        // Multi-column filter bindings
+        $('#filter-region').on('change', function() {
+            table.column(3).search(this.value).draw();
+        });
+
+        $('#filter-language').on('change', function() {
+            table.column(5).search(this.value).draw();
+        });
+
+        $('#filter-category').on('change', function() {
+            table.column(4).search(this.value).draw();
+        });
+
+        $('#filter-country').on('change', function() {
+            table.column(2).search(this.value).draw();
+        });
+
+        // Reset search structures
+        $('#btn-reset-filters').on('click', function() {
+            $('.select-field').val('');
+            $('.dataTables_filter input').val('');
+            table.search('').columns().search('').draw();
+        });
+
+        // Ajax authorization login handler
+        $('#ajax-login-form').on('submit', function(e) {
+            e.preventDefault();
+            const username = $('#login-username').val();
+            const password = $('#login-password').val();
+            
+            $.ajax({
+                url: '/api/auth/login',
+                type: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({ username, password }),
+                success: function(response) {
+                    location.reload(); // Reload page to bind correct Admin roles
+                },
+                error: function(err) {
+                    const msg = err.responseJSON ? err.responseJSON.error : "Login validation rejected.";
+                    $('#login-error-alert').text(msg).removeClass('d-none');
+                }
+            });
+        });
+
+        // Live telemetry updates using Interval pool (Keep 'Current TG' indicators updated live)
+        setInterval(function() {
+            $.get('/api/status', function(status) {
+                if (status && status.current_tg) {
+                    const newTg = status.current_tg;
+                    if (newTg !== currentTunedTg) {
+                        updatePageTuningIndicator(newTg);
+                    }
+                }
+            });
+        }, 4000);
+    });
+
+    // Gateway switch action handler (Switches target TG using '/opt/MMDVM_Bridge/dvswitch.sh tune <TG>')
+    function triggerGatewayTune(tgNumber) {
+        if (!isLoggedIn) {
+            // Trigger login popup modal automatically
+            const modalEl = document.getElementById('authModal');
+            if (modalEl) {
+                const bootstrapModal = new bootstrap.Modal(modalEl);
+                bootstrapModal.show();
+            } else {
+                alert("Please log in to standard operator panel first.");
+            }
+            return;
+        }
+
+        // Show spinner / loading feedback
+        const btn = $(`#btn-tune-${tgNumber}`);
+        const origHtml = btn.html();
+        btn.html('<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> TUNING...').prop('disabled', true);
+
+        $.ajax({
+            url: '/api/talkgroup/tune',
+            type: 'POST',
+            contentType: 'application/json',
+            data: JSON.stringify({ tg: tgNumber }),
+            success: function(response) {
+                showAlert('success', `Tuned Station successfully! Current Active talkgroup set to TG ${tgNumber}.`);
+                updatePageTuningIndicator(tgNumber);
+            },
+            error: function(err) {
+                const errMsg = err.responseJSON ? err.responseJSON.error : "Failed executing tune script.";
+                showAlert('danger', `Tune Rejection: ${errMsg}`);
+                btn.html(origHtml).prop('disabled', false);
+            }
+        });
+    }
+
+    // Swaps tuning button with active tuned checks throughout DataTable Rows
+    function updatePageTuningIndicator(newTg) {
+        currentTunedTg = newTg;
+        
+        // Update upper cockpit display text
+        $('#current-tg-indicator').html(`<i data-lucide="radio" class="w-4 h-4 text-primary animate-pulse d-inline-block"></i> TG ${newTg}`);
+        lucide.createIcons();
+
+        // Find all interactive cells and reset buttons, then construct the checked status for active target row
+        table.rows().every(function(rowIdx) {
+            const row = $(this.node());
+            // Extract the talkgroup number from this row's structure (from TG column badges)
+            const rowBadgeText = row.find('.tg-badge').text().replace('TG ', '').trim();
+            const rowTgNum = parseInt(rowBadgeText);
+            const actionCell = row.find('td:last-child');
+
+            if (rowTgNum === newTg) {
+                actionCell.html(`
+                    <div class="tuned-indicator" id="indicator-${newTg}">
+                        <i data-lucide="check" class="w-4 h-4"></i>
+                        TUNED
+                    </div>
+                `);
+            } else {
+                actionCell.html(`
+                    <button class="btn-tune" id="btn-tune-${rowTgNum}" onclick="triggerGatewayTune(${rowTgNum})">
+                        <i data-lucide="chevron-right" class="w-4 h-4"></i>
+                        SWITCH TG
+                    </button>
+                `);
+            }
+        });
+
+        lucide.createIcons();
+    }
+
+    function showAlert(type, message) {
+        const iconName = type === 'success' ? 'check-circle' : 'alert-triangle';
+        const bgClass = type === 'success' ? 'alert-success border-success bg-success bg-opacity-10 text-success' : 'alert-danger border-danger bg-danger bg-opacity-10 text-danger';
+        
+        const alertHtml = `
+            <div class="alert ${bgClass} d-flex align-items-center gap-2 alert-dismissible fade show mb-4 rounded-xl" role="alert">
+                <i data-lucide="${iconName}" class="w-5 h-5 shrink-0"></i>
+                <div>${message}</div>
+                <button type="button" class="btn-close btn-close-white ms-auto" style="filter: invert(1);" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+        `;
+        $('#alert-container').html(alertHtml);
+        lucide.createIcons();
+    }
+</script>
+</body>
+</html>
