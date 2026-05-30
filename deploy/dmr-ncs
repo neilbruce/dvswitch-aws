@@ -1,0 +1,12 @@
+#!/bin/bash
+set -euo pipefail
+COMMAND="${1:-healthcheck}"
+case "$COMMAND" in
+  healthcheck)
+    exec /opt/dmr_ncs_system/venv/bin/python /opt/dmr_ncs_system/dmr-ncs-healthcheck.py
+    ;;
+  *)
+    echo "Usage: dmr-ncs healthcheck" >&2
+    exit 64
+    ;;
+esac

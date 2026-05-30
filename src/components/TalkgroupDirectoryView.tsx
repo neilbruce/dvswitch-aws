@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Search, Globe, ChevronRight, Check, SlidersHorizontal, RotateCcw, Radio, ShieldCheck } from 'lucide-react';
+import { Search, Globe, ChevronRight, Check, SlidersHorizontal, RotateCcw, Radio, ShieldCheck, RefreshCw } from 'lucide-react';
 
 interface TalkgroupItem {
   number: number;
@@ -27,6 +27,8 @@ export default function TalkgroupDirectoryView({ isLoggedIn, username, onTuneSuc
   const [currentTg, setCurrentTg] = useState<number | null>(null);
   const [tuningTg, setTuningTg] = useState<number | null>(null);
   const [successTg, setSuccessTg] = useState<number | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMessage, setSyncMessage] = useState("");
 
   // Auto-deduplicated filters from current list
   const [regions, setRegions] = useState<string[]>([]);
@@ -129,6 +131,28 @@ export default function TalkgroupDirectoryView({ isLoggedIn, username, onTuneSuc
     }
   };
 
+
+  const handleSyncTalkgroups = async () => {
+    if (!isLoggedIn) {
+      alert("Please sign in with Operator or Administrator access to synchronize BrandMeister talkgroups.");
+      return;
+    }
+    setSyncing(true);
+    setSyncMessage("");
+    try {
+      const res = await fetch('/api/talkgroups/sync', { method: 'POST' });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(payload.error || 'BrandMeister sync failed');
+      setSyncMessage(`Synchronized ${payload.count} talkgroups from BrandMeister.`);
+      await fetchFilterMeta();
+      await fetchFilteredTalkgroups();
+    } catch (error) {
+      setSyncMessage(error instanceof Error ? error.message : 'BrandMeister sync failed');
+    } finally {
+      setSyncing(false);
+    }
+  };
+
   const handleResetFilters = () => {
     setSearch("");
     setFilterRegion("");
@@ -188,14 +212,25 @@ export default function TalkgroupDirectoryView({ isLoggedIn, username, onTuneSuc
             <SlidersHorizontal className="w-4 h-4 text-blue-400" />
             <h2>Multi-Column Advanced Filters</h2>
           </div>
-          <button 
-            onClick={handleResetFilters}
-            className="text-xs text-slate-400 hover:text-white transition flex items-center gap-1 bg-slate-800 hover:bg-slate-750 px-3 py-1.5 rounded-lg border border-slate-700/50 cursor-pointer"
-          >
-            <RotateCcw className="w-3.5 h-3.5" />
-            Reset Custom Filters
-          </button>
+          <div className="flex items-center gap-2">
+            <button 
+              onClick={handleSyncTalkgroups}
+              disabled={syncing || !isLoggedIn}
+              className="text-xs text-slate-300 hover:text-white transition flex items-center gap-1 bg-blue-600/20 hover:bg-blue-600/30 px-3 py-1.5 rounded-lg border border-blue-500/30 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${syncing ? 'animate-spin' : ''}`} />
+              Sync BrandMeister
+            </button>
+            <button 
+              onClick={handleResetFilters}
+              className="text-xs text-slate-400 hover:text-white transition flex items-center gap-1 bg-slate-800 hover:bg-slate-750 px-3 py-1.5 rounded-lg border border-slate-700/50 cursor-pointer"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              Reset Custom Filters
+            </button>
+          </div>
         </div>
+        {syncMessage && <p className="text-xs text-slate-400">{syncMessage}</p>}
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           <div>

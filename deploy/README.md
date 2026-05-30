@@ -58,10 +58,9 @@ Users can log in with:
 
 | User Account | Access Key Passphrase | Role Permissions |
 | :--- | :--- | :--- |
-| **admin** | `vulcan3efz!` | Full Admin (Tune TG, Service stop/reboots, Start nets, CSV/ADIF Exports) |
-| **readonly** | `radio` | Guest Observer (View status indicators, logs, APRS compass feeds) |
+| `${INITIAL_ADMIN_USERNAME:-admin}` | Provided by `INITIAL_ADMIN_PASSWORD` during installation | Full Admin (Tune TG, Service stop/reboots, Start nets, CSV/ADIF Exports) |
 
-Passwords must be securely updated and changed in the db models setting inside `/opt/dmr_ncs_system/setup_database.py`.
+Set `INITIAL_ADMIN_PASSWORD` before running `deploy/install.sh`; the installer refuses to create a deployment with a hard-coded default password.
 
 ---
 

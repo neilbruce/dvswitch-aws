@@ -47,7 +47,7 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-python setup_database.py --admin admin --password "vulcan3efz!"
+python setup_database.py --admin "\${INITIAL_ADMIN_USERNAME:-admin}" --password "\${INITIAL_ADMIN_PASSWORD:?Set INITIAL_ADMIN_PASSWORD}"
 
 chown -R root:www-data "$INSTALL_DIR"
 chmod -R 775 "$INSTALL_DIR"
