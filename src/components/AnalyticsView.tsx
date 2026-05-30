@@ -31,16 +31,15 @@ interface StationItem {
 
 export default function AnalyticsView() {
   const [stations, setStations] = useState<StationItem[]>([]);
+  const [heardHistory, setHeardHistory] = useState<Array<{ timestamp: string }>>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const fetchStations = async () => {
       try {
-        const res = await fetch('/api/stations');
-        if (res.ok) {
-          const data = await res.json();
-          setStations(data);
-        }
+        const [stationRes, historyRes] = await Promise.all([fetch('/api/stations'), fetch('/api/heard/history?range=day')]);
+        if (stationRes.ok) setStations(await stationRes.json());
+        if (historyRes.ok) setHeardHistory(await historyRes.json());
       } catch (err) {
         console.error(err);
       } finally {
@@ -81,15 +80,18 @@ export default function AnalyticsView() {
     value: val
   })).sort((a, b) => b.value - a.value).slice(0, 5);
 
-  // 3. Simulated Hourly Volume Chart
-  const hourlyData = [
-    { hour: "00:00", transmissions: 420 },
-    { hour: "04:00", transmissions: 180 },
-    { hour: "08:00", transmissions: 650 },
-    { hour: "12:00", transmissions: 1200 },
-    { hour: "16:00", transmissions: 840 },
-    { hour: "20:00", transmissions: 1540 },
-  ];
+  // 3. Hourly volume from heard-history records
+  const hourlyBuckets: Record<string, number> = {};
+  heardHistory.forEach((record) => {
+    const date = new Date(record.timestamp);
+    if (!Number.isNaN(date.getTime())) {
+      const hour = `${date.getHours().toString().padStart(2, '0')}:00`;
+      hourlyBuckets[hour] = (hourlyBuckets[hour] || 0) + 1;
+    }
+  });
+  const hourlyData = Object.entries(hourlyBuckets)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([hour, transmissions]) => ({ hour, transmissions }));
 
   return (
     <div className="space-y-6">
@@ -204,7 +206,7 @@ export default function AnalyticsView() {
           </div>
         </div>
 
-        {/* Graph 3: Simulated Activity peaks */}
+        {/* Graph 3: Activity peaks */}
         <div className="bg-white rounded-xl border border-gray-100 p-5 shadow-sm space-y-4 lg:col-span-2">
           <h3 className="text-xs font-bold text-gray-400 uppercase tracking-widest block font-sans flex items-center gap-1.5">
             <TrendingUp className="w-4 h-4 text-indigo-500" />

@@ -203,7 +203,7 @@ export default function DashboardView({ onViewChange, isLoggedIn, triggerRefresh
               <span className="w-2.5 h-2.5 rounded-full bg-green-500 inline-block animate-pulse"></span>
               {status.brandmeister_status}
             </span>
-            <span className="text-[10px] text-gray-400 font-mono block">IP: 15.206.12.84</span>
+            <span className="text-[10px] text-gray-400 font-mono block">IP: {status.server_public_ip || "configured by host"}</span>
           </div>
         </div>
 
@@ -352,8 +352,8 @@ export default function DashboardView({ onViewChange, isLoggedIn, triggerRefresh
 
           <div className="pt-4 border-t border-gray-50 text-xs font-mono text-gray-500 flex flex-col gap-2">
             <div className="flex justify-between">
-              <span>EC2 Platform:</span>
-              <span className="text-gray-900 font-bold">AWS t3.medium</span>
+              <span>Host Platform:</span>
+              <span className="text-gray-900 font-bold">Ubuntu DVSwitch</span>
             </div>
             <div className="flex justify-between">
               <span>Public IP:</span>

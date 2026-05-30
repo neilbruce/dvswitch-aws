@@ -262,9 +262,7 @@ export default function App() {
             </form>
 
             <div className="border-t border-gray-50 pt-3 text-[10px] text-gray-400 text-center font-mono">
-              Demo Credentials:<br />
-              Admin: <code className="font-bold text-gray-700">admin</code> | Pass: <code className="font-bold text-gray-700">vulcan3efz!</code><br />
-              Observer: <code className="font-bold text-gray-700">readonly</code> | Pass: <code className="font-bold text-gray-700">radio</code>
+              Use the administrator account created from <code className="font-bold text-gray-700">INITIAL_ADMIN_USERNAME</code> and <code className="font-bold text-gray-700">INITIAL_ADMIN_PASSWORD</code>.
             </div>
           </div>
         </div>

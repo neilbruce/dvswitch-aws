@@ -3,12 +3,17 @@ import os
 import sys
 import datetime
 import json
+import hashlib
+import re
+import socket
+import threading
+import time
 import subprocess
 import csv
 import io
 import psutil
 from zoneinfo import ZoneInfo
-from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, send_file, make_response
+from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, send_file, make_response, session
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from flask_wtf.csrf import CSRFProtect
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -16,7 +21,7 @@ import requests
 
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
-from models import db, User, Role, Station, Heard, Net, CheckIn, Talkgroup, Country, Aprs, AuditLog, Setting, Event, Report
+from models import db, User, Role, Station, Heard, HeardHistory, Net, CheckIn, Talkgroup, TalkgroupFavorite, TalkgroupRecent, RadioIdCache, LogCursor, Country, Aprs, AuditLog, Setting, Event, Report
 
 # Establish Flask App and Load Configuration
 app = Flask(__name__)
@@ -32,7 +37,25 @@ login_manager.init_app(app)
 login_manager.login_view = 'login_html'
 
 # Timezone configurations
-IST = ZoneInfo("Asia/Kolkata")
+IST = ZoneInfo(Config.TIMEZONE)
+RADIOID_LAST_REQUEST_AT = 0.0
+SERVICE_ACTIONS = {"start", "stop", "restart"}
+
+
+@app.before_request
+def enforce_api_same_origin_csrf():
+    if request.method in {'GET', 'HEAD', 'OPTIONS', 'TRACE'}:
+        return None
+    if not request.path.startswith('/api/'):
+        csrf.protect()
+        return None
+    origin = request.headers.get('Origin') or request.headers.get('Referer')
+    if origin:
+        from urllib.parse import urlparse
+        parsed = urlparse(origin)
+        if parsed.netloc and parsed.netloc != request.host:
+            return jsonify({"error": "CSRF origin check failed"}), 403
+    return None
 
 # Secure Login User Loader
 @login_manager.user_loader
@@ -59,466 +82,325 @@ def log_audit_action(action, target="", status="success", username=None):
     db.session.add(log_entry)
     db.session.commit()
 
-# --- BACKGROUND PARSING & NET CONTROL SCHEDULER ENGINE ---
-def parse_mmdvm_logs_job():
-    """
-    Parse the MMDVM logs to populate the Heard database, Station records and current activity.
-    Processes today's log file using a seek offset stored in the Settings database to capture lines exactly once.
-    """
-    with app.app_context():
-        today_str = datetime.datetime.now(IST).strftime("%Y-%m-%d")
-        log_file_name = f"MMDVM_Bridge-{today_str}.log"
-        log_file_path = os.path.join(Config.LOG_DIR, log_file_name)
-        
-        if not os.path.exists(log_file_path):
-            return # No active logs for today yet
-            
-        try:
-            # Persistent state tracking from Settings database
-            saved_file = Setting.query.filter_by(key="log_parser_filename").first()
-            saved_offset = Setting.query.filter_by(key="log_parser_offset").first()
-            
-            offset = 0
-            if saved_file and saved_file.value == log_file_name:
-                if saved_offset:
-                    try:
-                        offset = int(saved_offset.value)
-                    except ValueError:
-                        offset = 0
-            else:
-                # File rotated to a new day or first time running.
-                if not saved_file:
-                    saved_file = Setting(key="log_parser_filename", value=log_file_name, group="system_log")
-                    db.session.add(saved_file)
-                else:
-                    saved_file.value = log_file_name
-                
-                if not saved_offset:
-                    saved_offset = Setting(key="log_parser_offset", value="0", group="system_log")
-                    db.session.add(saved_offset)
-                else:
-                    saved_offset.value = "0"
-                db.session.commit()
-                offset = 0
-                
-            file_size = os.path.getsize(log_file_path)
-            if file_size < offset:
-                # File was truncated/cleared
-                offset = 0
-                
-            if file_size == offset:
-                return # No new logs written
-                
-            with open(log_file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                f.seek(offset)
-                new_data = f.read()
-                new_offset = f.tell()
-                
-            if not new_data:
-                return
-                
-            # Parse only newly appended logs
-            lines = new_data.splitlines()
-            for line in lines:
-                if not line.strip():
-                    continue
-                # Log parsing logic for TX Voice Headers and transmissions
-                # Matches: "received network voice header from KF0VOX to TG 91"
-                if "received network voice header from" in line:
-                    parts = line.strip().split(" ")
-                    try:
-                        from_idx = parts.index("from")
-                        sub_parts = parts[from_idx+1:]
-                        callsign = sub_parts[0]
-                        to_idx = sub_parts.index("to")
-                        tg = int(sub_parts[to_idx+2]) # 'to TG 91' -> sub_parts[to_idx+1] == "TG", index+2 == 91
-                        
-                        # Process Database Insert/Update
-                        process_transmission(callsign, tg, airtime=3)
-                    except Exception:
-                        continue
-                
-                # Matches: "Begin TX: src=4040444 rpt=404044418 dst=404 slot=2 cc=1 metadata=VU3EFZ"
-                elif "Begin TX" in line:
-                    try:
-                        src = ""
-                        dst = ""
-                        call = ""
-                        for part in line.split(" "):
-                            if part.startswith("src="):
-                                src = part.split("=")[1]
-                            elif part.startswith("dst="):
-                                dst = part.split("=")[1]
-                            elif part.startswith("metadata="):
-                                call = part.split("=")[1].strip()
-                        
-                        if call and dst:
-                            process_transmission(call, int(dst), airtime=4, dmr_id=src)
-                    except Exception:
-                        continue
-            
-            # Save progress position offset to disk
-            saved_offset.value = str(new_offset)
-            db.session.commit()
-            
-        except Exception as e:
-            db.session.rollback()
-            event = Event(event_type="log_parser", message=f"Log parse error: {str(e)}", severity="error")
-            db.session.add(event)
-            db.session.commit()
 
-def lookup_radio_metadata(callsign):
-    """
-    Look up station metadata from RadioID.net and BrandMeister user databases.
-    Returns dictionary containing: dmr_id, name, country, state, city
-    """
-    import urllib.request
-    import json
-    import ssl
-    
-    country = determine_country(callsign)
-    result = {
-        "dmr_id": None,
-        "name": "",
-        "country": country,
-        "state": "",
-        "city": ""
-    }
-    
+# --- PRODUCTION RADIO, BRANDMEISTER, APRS AND NCS SERVICE LAYER ---
+def utcnow():
+    return datetime.datetime.utcnow()
+
+def sanitize(value, max_len=120):
+    return str(value or '').replace('\r', ' ').replace('\n', ' ').replace('\t', ' ').strip()[:max_len]
+
+def parse_int(value, minimum=1, maximum=9999999):
     try:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        
-        # Pull live record from database.radioid.net User Endpoint
-        url = f"https://database.radioid.net/api/v1/user?callsign={callsign.upper()}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) dmr-ncs-platform/1.0"})
-        
-        with urllib.request.urlopen(req, context=ctx, timeout=2) as response:
-            if response.status == 200:
-                data = json.loads(response.read().decode('utf-8'))
-                if data and "results" in data and len(data["results"]) > 0:
-                    user_data = data["results"][0]
-                    result["dmr_id"] = str(user_data.get("dmr_id", ""))
-                    result["name"] = f"{user_data.get('fname', '')} {user_data.get('lname', '')}".strip()
-                    result["country"] = user_data.get("country", country)
-                    result["state"] = user_data.get("state", "")
-                    result["city"] = user_data.get("city", "")
-                    return result
-    except Exception:
-        # Fallback to Brandmeister user registry on failure
+        parsed = int(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if minimum <= parsed <= maximum else None
+
+def adif_field(name, value):
+    text = str(value or '')
+    return f"<{name}:{len(text.encode('utf-8'))}>{text} "
+
+def get_ab_info():
+    data = {"tg": Config.DEFAULT_TALKGROUP, "call": Config.STATION_CALLSIGN, "gw": Config.STATION_DMR_ID, "rpt": Config.REPEATER_ID}
+    if os.path.exists(Config.AB_INFO_FILE):
         try:
-            url_bm = f"https://api.brandmeister.network/v2/user/{callsign.upper()}"
-            req_bm = urllib.request.Request(url_bm, headers={"User-Agent": "Mozilla/5.0 dmr-ncs-platform/1.0"})
-            with urllib.request.urlopen(req_bm, context=ctx, timeout=2) as response:
-                if response.status == 200:
-                    data = json.loads(response.read().decode('utf-8'))
-                    if data:
-                        result["name"] = data.get("name", "")
-                        result["country"] = data.get("country", country)
-                        return result
-        except Exception:
+            with open(Config.AB_INFO_FILE, 'r', encoding='utf-8') as fh:
+                digital = json.load(fh).get('digital', {})
+            data.update({
+                "tg": parse_int(digital.get('tg'), 1, 9999999) or data["tg"],
+                "call": sanitize(digital.get('call'), 30) or data["call"],
+                "gw": sanitize(digital.get('gw'), 30) or data["gw"],
+                "rpt": sanitize(digital.get('rpt'), 30) or data["rpt"],
+            })
+        except (OSError, json.JSONDecodeError):
             pass
-            
-    return result
-
-def process_transmission(callsign, talkgroup, airtime, dmr_id=""):
-    # Lookup/Create Station with DMR metadata enrichment
-    station = Station.query.filter_by(callsign=callsign).first()
-    metadata = lookup_radio_metadata(callsign)
-    country = metadata["country"] or determine_country(callsign)
-    name = metadata["name"]
-    final_dmr_id = dmr_id or metadata["dmr_id"] or f"404{datetime.datetime.now().microsecond}"
-    
-    if not station:
-        station = Station(
-            dmr_id=final_dmr_id,
-            callsign=callsign,
-            country=country,
-            first_heard=datetime.datetime.utcnow(),
-            last_heard=datetime.datetime.utcnow(),
-            total_airtime=airtime,
-            total_tx=1,
-            most_used_tg=talkgroup,
-            notes=f"Name: {name}. State/City: {metadata['state']} {metadata['city']}".strip() if (name or metadata['state']) else None
-        )
-        db.session.add(station)
-    else:
-        station.total_airtime += airtime
-        station.total_tx += 1
-        station.last_heard = datetime.datetime.utcnow()
-        if final_dmr_id:
-            station.dmr_id = final_dmr_id
-        if country and country != "Global / DX":
-            station.country = country
-        if name and not station.notes:
-            station.notes = f"Name: {name}. State/City: {metadata['state']} {metadata['city']}".strip()
-        db.session.add(station)
-
-    # Manage Net participation if Net is active
-    active_net = Net.query.filter_by(status='active').first()
-    net_part = False
-    net_id = None
-    if active_net and active_net.talkgroup == talkgroup:
-        net_part = True
-        net_id = active_net.id
-        # Log Checkin if not already checked in
-        existing_checkin = CheckIn.query.filter_by(net_id=active_net.id, callsign=callsign).first()
-        if not existing_checkin:
-            count = CheckIn.query.filter_by(net_id=active_net.id).count()
-            checkin = CheckIn(
-                net_id=active_net.id,
-                number=count + 1,
-                callsign=callsign,
-                dmr_id=station.dmr_id,
-                country=country,
-                timestamp=datetime.datetime.utcnow()
-            )
-            db.session.add(checkin)
-            
-            # Update totals
-            active_net.participant_count += 1
-            # Recalculate unique countries
-            unique_countries = db.session.query(CheckIn.country).filter(CheckIn.net_id == active_net.id).distinct().count()
-            active_net.country_count = unique_countries
-            station.total_nets += 1
-
-    # Record in LiveHeard
-    heard = Heard.query.filter_by(callsign=callsign, talkgroup=talkgroup).first()
-    if not heard:
-        heard = Heard(
-            callsign=callsign,
-            dmr_id=station.dmr_id,
-            country=country,
-            talkgroup=talkgroup,
-            first_heard=datetime.datetime.utcnow(),
-            last_heard=datetime.datetime.utcnow(),
-            tx_count=1,
-            airtime=airtime,
-            net_participation=net_part,
-            last_net_id=net_id
-        )
-        db.session.add(heard)
-    else:
-        heard.last_heard = datetime.datetime.utcnow()
-        heard.tx_count += 1
-        heard.airtime += airtime
-        if net_part:
-            heard.net_participation = True
-            heard.last_net_id = net_id
-        db.session.add(heard)
-
-    db.session.commit()
-
-def determine_country(callsign):
-    # Standard Radio Prefix Country Mapping
-    if callsign.startswith("VU"):
-        return "India"
-    elif callsign.startswith("W") or callsign.startswith("K") or callsign.startswith("N") or callsign.startswith("A"):
-        return "United States"
-    elif callsign.startswith("G") or callsign.startswith("M"):
-        return "United Kingdom"
-    elif callsign.startswith("VK"):
-        return "Australia"
-    elif callsign.startswith("I"):
-        return "Italy"
-    elif callsign.startswith("F"):
-        return "France"
-    elif callsign.startswith("JA") or callsign.startswith("JH") or callsign.startswith("JR") or callsign.startswith("JF"):
-        return "Japan"
-    elif callsign.startswith("VE") or callsign.startswith("VA"):
-        return "Canada"
-    else:
-        return "Global / DX"
-
-def auto_start_net_saturday():
-    """
-    Automated net initializer triggered precisely on Saturday at 21:30 IST via APScheduler.
-    """
-    with app.app_context():
-        now_ist = datetime.datetime.now(IST)
-        existing_active = Net.query.filter_by(status='active').first()
-        if not existing_active:
-            name = f"Worldwide TG91 Net - {now_ist.strftime('%d-%b-%Y')}"
-            net = Net(
-                name=name,
-                status='active',
-                talkgroup=91,
-                start_time=datetime.datetime.utcnow(),
-                participant_count=0,
-                country_count=0
-            )
-            db.session.add(net)
-            db.session.commit()
-            
-            # Tune bridge to TG 91
-            tune_tg_radio(91)
-            
-            event = Event(event_type="scheduler", message=f"Automated net session '{name}' initiated on Saturday schedule.", severity="info")
-            db.session.add(event)
-            db.session.commit()
-
-def auto_close_net_sunday():
-    """
-    Automated net sign-off triggered precisely on Sunday at 03:00 IST via APScheduler.
-    """
-    with app.app_context():
-        active_net = Net.query.filter_by(status='active').first()
-        if active_net:
-            active_net.status = 'closed'
-            active_net.end_time = datetime.datetime.utcnow()
-            td = active_net.end_time - active_net.start_time
-            active_net.duration = int(td.total_seconds() / 60)
-            db.session.commit()
-            
-            event = Event(event_type="scheduler", message=f"Automated net session '{active_net.name}' archived on Sunday schedule.", severity="info")
-            db.session.add(event)
-            db.session.commit()
-
-def tune_tg_radio(tg):
-    """
-    Invokes MMDVM Bridge switch script
-    """
-    dvs_script = Config.DVSWITCH_SCRIPT
-    if os.path.exists(dvs_script):
-        try:
-            subprocess.run([dvs_script, "tune", str(tg)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            # Update local ABInfo file to ensure sync
-            sync_ab_info(tg)
-            return True
-        except subprocess.SubprocessError as e:
-            print(f"Error executing tuning script: {e}")
-            return False
-    else:
-        # Fallback simulation for offline modes
-        sync_ab_info(tg)
-        return True
+    return data
 
 def sync_ab_info(tg):
-    info_path = Config.AB_INFO_FILE
-    data = {
-        "digital": {
-            "gw": "4040444",
-            "rpt": "404044418",
-            "tg": str(tg),
-            "call": "VU3EFZ"
-        }
-    }
+    directory = os.path.dirname(Config.AB_INFO_FILE)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(Config.AB_INFO_FILE, 'w', encoding='utf-8') as fh:
+        json.dump({"digital": {"gw": Config.STATION_DMR_ID, "rpt": Config.REPEATER_ID, "tg": str(tg), "call": Config.STATION_CALLSIGN}}, fh)
+
+def tune_tg_radio(tg):
+    parsed_tg = parse_int(tg)
+    if not parsed_tg:
+        return False, "Invalid talkgroup"
+    if not os.path.exists(Config.DVSWITCH_SCRIPT):
+        return False, f"DVSwitch tune script not found: {Config.DVSWITCH_SCRIPT}"
     try:
-        with open(info_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f"Failed to update ABInfo: {e}")
+        result = subprocess.run(["sudo", Config.DVSWITCH_SCRIPT, "tune", str(parsed_tg)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        sync_ab_info(parsed_tg)
+        db.session.add(TalkgroupRecent(talkgroup=parsed_tg, action='tune'))
+        db.session.commit()
+        return True, result.stdout.strip() or f"Tuned TG {parsed_tg}"
+    except (subprocess.SubprocessError, OSError) as exc:
+        db.session.rollback()
+        return False, str(exc)
+
+def disconnect_talkgroup():
+    if not os.path.exists(Config.DVSWITCH_SCRIPT):
+        return False, f"DVSwitch tune script not found: {Config.DVSWITCH_SCRIPT}"
+    try:
+        result = subprocess.run(["sudo", Config.DVSWITCH_SCRIPT, "disconnect"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        db.session.add(TalkgroupRecent(talkgroup=0, action='disconnect'))
+        db.session.commit()
+        return True, result.stdout.strip() or "Disconnected current talkgroup"
+    except (subprocess.SubprocessError, OSError) as exc:
+        db.session.rollback()
+        return False, str(exc)
+
+def systemd_status(unit):
+    try:
+        result = subprocess.run(['systemctl', 'is-active', unit], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        state = result.stdout.strip()
+        if state == 'active':
+            return 'running'
+        if state in {'inactive', 'deactivating'}:
+            return 'stopped'
+        return 'failed'
+    except (subprocess.SubprocessError, OSError):
+        return 'failed'
+
+def control_systemd_service(service, action):
+    if service not in Config.SYSTEMD_UNITS or action not in SERVICE_ACTIONS:
+        return False, "Invalid service or action"
+    unit = Config.SYSTEMD_UNITS[service]
+    try:
+        result = subprocess.run(['sudo', 'systemctl', action, unit], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=45)
+        output = result.stdout.strip() or result.stderr.strip() or f"systemctl {action} {unit} exited {result.returncode}"
+        return result.returncode == 0, output
+    except (subprocess.SubprocessError, OSError) as exc:
+        return False, str(exc)
+
+def lookup_radio_metadata(callsign=None, dmr_id=None):
+    global RADIOID_LAST_REQUEST_AT
+    now = utcnow()
+    cached = None
+    if dmr_id:
+        cached = RadioIdCache.query.filter_by(dmr_id=str(dmr_id)).first()
+    elif callsign:
+        cached = RadioIdCache.query.filter_by(callsign=callsign.upper()).first()
+    if cached and cached.expires_at > now:
+        return {"dmr_id": cached.dmr_id, "callsign": cached.callsign, "name": cached.name, "city": cached.city, "state": cached.state, "country": cached.country}
+    elapsed = time.monotonic() - RADIOID_LAST_REQUEST_AT
+    if elapsed < Config.RADIOID_MIN_INTERVAL_SECONDS:
+        time.sleep(Config.RADIOID_MIN_INTERVAL_SECONDS - elapsed)
+    params = {}
+    if dmr_id:
+        params['id'] = str(dmr_id)
+    if callsign:
+        params['callsign'] = callsign.upper()
+    if not params:
+        return {}
+    try:
+        RADIOID_LAST_REQUEST_AT = time.monotonic()
+        response = requests.get(Config.RADIOID_URL, params=params, timeout=6, headers={'User-Agent': 'dvswitch-aws-ncs/1.0'})
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict) and isinstance(payload.get('results'), list):
+            record = payload['results'][0] if payload['results'] else None
+        elif isinstance(payload, list):
+            record = payload[0] if payload else None
+        else:
+            record = payload if isinstance(payload, dict) else None
+        if not record:
+            return {}
+        normalized = {
+            "dmr_id": str(record.get('id') or record.get('radio_id') or record.get('dmr_id') or dmr_id or ''),
+            "callsign": sanitize(record.get('callsign') or callsign, 30).upper(),
+            "name": sanitize(record.get('name') or ' '.join(filter(None, [record.get('fname'), record.get('surname')])), 120),
+            "city": sanitize(record.get('city'), 100), "state": sanitize(record.get('state'), 100), "country": sanitize(record.get('country'), 100),
+        }
+        if normalized["dmr_id"] and normalized["callsign"]:
+            cache = RadioIdCache.query.filter_by(dmr_id=normalized["dmr_id"]).first() or RadioIdCache(dmr_id=normalized["dmr_id"], callsign=normalized["callsign"], expires_at=now)
+            cache.callsign = normalized["callsign"]; cache.name = normalized["name"]; cache.city = normalized["city"]; cache.state = normalized["state"]; cache.country = normalized["country"]
+            cache.raw_json = json.dumps(record); cache.fetched_at = now; cache.expires_at = now + datetime.timedelta(hours=Config.RADIOID_CACHE_HOURS)
+            db.session.merge(cache); db.session.commit()
+        return normalized
+    except requests.RequestException:
+        db.session.rollback(); return {}
+
+def upsert_station(metadata, talkgroup, airtime):
+    dmr_id = sanitize(metadata.get('dmr_id'), 30) or sanitize(metadata.get('callsign'), 30).upper()
+    callsign = sanitize(metadata.get('callsign'), 30).upper() or dmr_id
+    station = db.session.get(Station, dmr_id)
+    if not station:
+        station = Station(dmr_id=dmr_id, callsign=callsign, country=metadata.get('country') or 'Unknown', first_heard=utcnow())
+        db.session.add(station)
+    station.callsign = callsign; station.name = metadata.get('name') or station.name; station.city = metadata.get('city') or station.city; station.state = metadata.get('state') or station.state
+    station.country = metadata.get('country') or station.country or 'Unknown'; station.last_heard = utcnow(); station.total_airtime = (station.total_airtime or 0) + int(airtime or 0); station.total_tx = (station.total_tx or 0) + 1; station.most_used_tg = talkgroup
+    if metadata.get('dmr_id'): station.radioid_updated_at = utcnow()
+    return station
+
+def process_transmission(callsign, talkgroup, airtime, dmr_id="", source='mmdvm', raw=''):
+    tg = parse_int(talkgroup)
+    if not tg: return
+    metadata = lookup_radio_metadata(callsign=sanitize(callsign, 30).upper() or None, dmr_id=sanitize(dmr_id, 30) or None)
+    metadata.setdefault('callsign', sanitize(callsign, 30).upper()); metadata.setdefault('dmr_id', sanitize(dmr_id, 30)); metadata.setdefault('country', metadata.get('country') or 'Unknown')
+    station = upsert_station(metadata, tg, airtime)
+    heard = Heard.query.filter_by(dmr_id=station.dmr_id, talkgroup=tg).first()
+    if not heard:
+        heard = Heard(callsign=station.callsign, dmr_id=station.dmr_id, talkgroup=tg, first_heard=utcnow())
+        db.session.add(heard)
+    heard.callsign = station.callsign; heard.name = station.name; heard.city = station.city; heard.country = station.country; heard.last_heard = utcnow(); heard.tx_count = (heard.tx_count or 0) + 1; heard.airtime = (heard.airtime or 0) + int(airtime or 0)
+    db.session.add(HeardHistory(source=source, callsign=station.callsign, dmr_id=station.dmr_id, name=station.name, city=station.city, country=station.country, talkgroup=tg, started_at=utcnow(), ended_at=utcnow(), duration=int(airtime or 0), raw=raw[:1000]))
+    active_net = Net.query.filter_by(status='active', talkgroup=tg).first()
+    if active_net:
+        checkin = CheckIn.query.filter_by(net_id=active_net.id, dmr_id=station.dmr_id).first()
+        late_cutoff = active_net.start_time + datetime.timedelta(minutes=30)
+        if checkin:
+            checkin.last_heard_time = utcnow()
+        else:
+            checkin = CheckIn(net_id=active_net.id, number=active_net.checkins.count() + 1, callsign=station.callsign, dmr_id=station.dmr_id, name=station.name, city=station.city, country=station.country or 'Unknown', timestamp=utcnow(), join_time=utcnow(), last_heard_time=utcnow(), validated=(tg == Config.NET_AUTOMATIC_TG), late_checkin=utcnow() > late_cutoff)
+            db.session.add(checkin); station.total_nets = (station.total_nets or 0) + 1
+        active_net.participant_count = active_net.checkins.count(); active_net.country_count = len({c.country for c in active_net.checkins.all() if c.country}); heard.net_participation = True; heard.last_net_id = active_net.id
+    db.session.commit()
+
+def parse_log_line(line, source):
+    tg_match = re.search(r'(?:dst|Dst|TG|to\s+TG|Talkgroup)[:=\s]+(\d{1,7})', line)
+    id_match = re.search(r'(?:src|Src|source|DMR ID)[:=\s]+(\d{4,10})', line)
+    call_match = re.search(r'(?:metadata=|from\s+|Callsign[:=\s]+)([A-Z0-9]{3,10})', line, re.IGNORECASE)
+    duration_match = re.search(r'(?:airtime|duration|seconds?)[:=\s]+(\d{1,4})', line, re.IGNORECASE)
+    if not tg_match or (not id_match and not call_match): return None
+    return {'talkgroup': int(tg_match.group(1)), 'dmr_id': id_match.group(1) if id_match else '', 'callsign': call_match.group(1).upper() if call_match else '', 'airtime': int(duration_match.group(1)) if duration_match else 1, 'source': source, 'raw': line}
+
+def log_sources_for_today():
+    today_str = datetime.datetime.now(IST).strftime('%Y-%m-%d')
+    return {'mmdvm': Config.MMDVM_LOG_PATH or os.path.join(Config.MMDVM_LOG_DIR, f'MMDVM_Bridge-{today_str}.log'), 'dvswitch': Config.DVSWITCH_LOG_PATH, 'analog_bridge': Config.ANALOG_BRIDGE_LOG_PATH}
+
+def parse_radio_logs_job():
+    with app.app_context():
+        for source, path in log_sources_for_today().items():
+            if not path or not os.path.exists(path): continue
+            try:
+                stat = os.stat(path); cursor = db.session.get(LogCursor, source) or LogCursor(source=source, path=path, offset=0)
+                if cursor.path != path or cursor.inode != str(stat.st_ino) or cursor.offset > stat.st_size: cursor.path = path; cursor.inode = str(stat.st_ino); cursor.offset = 0
+                if cursor.offset == stat.st_size: continue
+                with open(path, 'r', encoding='utf-8', errors='ignore') as fh: fh.seek(cursor.offset); data = fh.read(); cursor.offset = fh.tell()
+                cursor.updated_at = utcnow(); db.session.merge(cursor)
+                for line in data.splitlines():
+                    parsed = parse_log_line(line, source)
+                    if parsed: process_transmission(parsed['callsign'], parsed['talkgroup'], parsed['airtime'], parsed['dmr_id'], parsed['source'], parsed['raw'])
+                db.session.commit()
+            except Exception as exc:
+                db.session.rollback(); db.session.add(Event(event_type='log', message=f'{source} parser failed: {exc}', severity='error')); db.session.commit()
+
+def sync_brandmeister_talkgroups():
+    payload = fetch_brandmeister_json(Config.BRANDMEISTER_TALKGROUP_URL, cache_seconds=300)
+    rows = payload if isinstance(payload, list) else payload.get('results', []) if isinstance(payload, dict) else []
+    count = 0
+    for item in rows:
+        number = parse_int(item.get('id') or item.get('tg') or item.get('number') or item.get('talkgroup'))
+        if not number: continue
+        tg = db.session.get(Talkgroup, number) or Talkgroup(number=number, name=f'TG {number}', country='Worldwide')
+        tg.name = sanitize(item.get('name') or item.get('title') or tg.name, 120) or f'TG {number}'; tg.country = sanitize(item.get('country') or item.get('country_name') or tg.country or 'Worldwide', 100); tg.description = sanitize(item.get('description') or item.get('desc') or tg.name, 255); tg.category = sanitize(item.get('category') or item.get('type') or 'BrandMeister', 100); tg.language = sanitize(item.get('language') or item.get('lang') or '', 100); tg.region = sanitize(item.get('region') or item.get('continent') or tg.country, 100); tg.source = 'BrandMeister'; tg.updated_at = utcnow(); db.session.merge(tg); count += 1
+    db.session.merge(Setting(key='brandmeister_tg_last_sync', value=utcnow().isoformat(), group='brandmeister')); db.session.commit(); return count
+
+def fetch_brandmeister_json(url, params=None, cache_seconds=60):
+    params = params or {}
+    cache_key = 'bm_cache_' + hashlib.sha256((url + json.dumps(params, sort_keys=True)).encode('utf-8')).hexdigest()
+    cached = db.session.get(Setting, cache_key)
+    if cached:
+        try:
+            payload = json.loads(cached.value)
+            fetched_at = datetime.datetime.fromisoformat(payload['fetched_at'])
+            if utcnow() - fetched_at < datetime.timedelta(seconds=cache_seconds):
+                return payload['data']
+        except (KeyError, ValueError, json.JSONDecodeError):
+            pass
+    last_exc = None
+    for attempt in range(3):
+        try:
+            response = requests.get(url, params=params, timeout=10, headers={'User-Agent': 'dvswitch-aws-ncs/1.0'})
+            response.raise_for_status()
+            data = response.json()
+            db.session.merge(Setting(key=cache_key, value=json.dumps({'fetched_at': utcnow().isoformat(), 'data': data}), group='brandmeister_cache'))
+            db.session.commit()
+            return data
+        except requests.RequestException as exc:
+            last_exc = exc
+            time.sleep(1 + attempt)
+    if cached:
+        return json.loads(cached.value).get('data')
+    raise last_exc
+
+def parse_aprs_position(line):
+    match = re.match(r'^([A-Z0-9-]+)>[^:]+:([!=/])(\d{2})(\d{2}\.\d{2})([NS])(.)(\d{3})(\d{2}\.\d{2})([EW])(.)(.*)$', line, re.IGNORECASE)
+    if not match: return None
+    lat = int(match.group(3)) + float(match.group(4)) / 60; lon = int(match.group(7)) + float(match.group(8)) / 60
+    if match.group(5) == 'S': lat *= -1
+    if match.group(9) == 'W': lon *= -1
+    comment = match.group(11) or ''; course_speed = re.search(r'(\d{3})/(\d{3})', comment)
+    return Aprs(callsign=match.group(1).upper(), timestamp=utcnow(), latitude=lat, longitude=lon, speed=float(course_speed.group(2))*1.852 if course_speed else 0.0, heading=int(course_speed.group(1)) if course_speed else 0, comment=sanitize(comment, 255), symbol=f'{match.group(6)}{match.group(10)}', raw=line)
+
+def prune_aprs_rows():
+    cutoff = utcnow() - datetime.timedelta(days=Config.APRS_RETENTION_DAYS); Aprs.query.filter(Aprs.timestamp < cutoff).delete(); overflow = Aprs.query.count() - Config.APRS_MAX_ROWS
+    if overflow > 0:
+        for row in Aprs.query.order_by(Aprs.timestamp.asc()).limit(overflow).all(): db.session.delete(row)
 
 def aprs_is_listener():
-    """
-    Background worker that connects to rotate.aprs2.net:14580, logs in as guest,
-    streams live APRS-IS positional packets, extracts beacon locations, and populates the Map.
-    """
-    import socket
-    import re
-    import time
-    
-    server_host = "rotate.aprs2.net"
-    server_port = 14580
-    callsign = "N0CALL"
-    passcode = "-1"
-    filter_expr = "t/p" # Beacons from position-reporting systems
-    
+    if not Config.APRS_ENABLED: return
     while True:
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(30)
-            s.connect((server_host, server_port))
-            
-            login_str = f"user {callsign} pass {passcode} vers dmr-ncs-console 1.0 filter {filter_expr}\r\n"
-            s.sendall(login_str.encode('utf-8'))
-            
-            buffer = ""
-            while True:
-                try:
-                    data = s.recv(4096).decode('utf-8', errors='ignore')
-                except socket.timeout:
-                    break
-                if not data:
-                    break
-                buffer += data
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
-                    if line.startswith("#") or not line:
-                        continue
-                     
-                    # Parse standard APRS coordinate packet:
-                    # e.g., VU3EFZ-9>APRS,TCPIP*,qAC,T2INDIA:!1258.17N/07735.46E#PHG5130/DMR hotspot
-                    pos_match = re.search(r'([A-Z0-9\-]+)>.*?:[:@=]?(?:\d{6}[zh])?(\d{2})(\d{2}\.\d{2})([NS])([\/\\_])(\d{3})(\d{2}\.\d{2})([EW])', line)
-                    if pos_match:
-                        call = pos_match.group(1)
-                        lat_deg = float(pos_match.group(2))
-                        lat_min = float(pos_match.group(3))
-                        lat_dir = pos_match.group(4)
-                        sym_table = pos_match.group(5)
-                        lon_deg = float(pos_match.group(6))
-                        lon_min = float(pos_match.group(7))
-                        lon_dir = pos_match.group(8)
-                        
-                        latitude = lat_deg + (lat_min / 60.0)
-                        if lat_dir == 'S':
-                            latitude = -latitude
-                        longitude = lon_deg + (lon_min / 60.0)
-                        if lon_dir == 'W':
-                            longitude = -longitude
-                            
-                        # Parse symbol and comment details
-                        idx = line.find(f"{lon_dir}")
-                        symbol = "[-]"
-                        comment = "APRS-IS Live Node"
-                        if idx != -1 and idx + 1 < len(line):
-                            symbol = sym_table + line[idx+1]
-                            comment = line[idx+2:].strip()[:200] if idx + 2 < len(line) else "APRS-IS Live Node"
-                            
-                        with app.app_context():
-                            record = Aprs.query.filter_by(callsign=call).first()
-                            if not record:
-                                record = Aprs(callsign=call)
-                            
-                            record.latitude = latitude
-                            record.longitude = longitude
-                            record.timestamp = datetime.datetime.utcnow()
-                            record.altitude = 0.0
-                            record.speed = 0.0
-                            record.heading = 0
-                            record.comment = comment if comment else "APRS-IS Live Station"
-                            record.symbol = symbol
-                            
-                            db.session.add(record)
-                            db.session.commit()
-                            
-                            # Limit total history inside SQLite to prevent disk inflation
-                            count = Aprs.query.count()
-                            if count > 100:
-                                oldest = Aprs.query.order_by(Aprs.timestamp.asc()).first()
-                                if oldest:
-                                    db.session.delete(oldest)
-                                    db.session.commit()
-                time.sleep(0.01)
-        except Exception as e:
-            print("[APRS-IS Listener Error] Reconnecting in 15 seconds: ", e)
-        time.sleep(15)
+            with socket.create_connection((Config.APRS_IS_HOST, Config.APRS_IS_PORT), timeout=30) as sock:
+                sock.settimeout(60); sock.sendall(f'user {Config.APRS_IS_CALLSIGN} pass {Config.APRS_IS_PASSCODE} vers dvswitch-aws-ncs 1.0 filter {Config.APRS_IS_FILTER}\n'.encode('ascii'))
+                buffer = ''
+                while True:
+                    chunk = sock.recv(4096).decode('utf-8', errors='ignore')
+                    if not chunk: break
+                    buffer += chunk; lines = buffer.splitlines(); buffer = '' if buffer.endswith(('\n','\r')) else (lines.pop() if lines else '')
+                    with app.app_context():
+                        for line in lines:
+                            if line and not line.startswith('#'):
+                                packet = parse_aprs_position(line)
+                                if packet: db.session.add(packet); db.session.add(Event(event_type='aprs', message=f'APRS packet {packet.callsign}', severity='info'))
+                        prune_aprs_rows(); db.session.commit()
+        except Exception as exc:
+            with app.app_context(): db.session.rollback(); db.session.add(Event(event_type='aprs', message=f'APRS-IS reconnect after error: {exc}', severity='warning')); db.session.commit()
+            time.sleep(30)
 
-def start_aprs_is_listener():
-    import threading
-    t = threading.Thread(target=aprs_is_listener, daemon=True)
-    t.start()
-    print("[APRS-IS Ingestion Engine] Client daemon thread is running in the background.")
+def start_aprs_is_listener(): threading.Thread(target=aprs_is_listener, daemon=True).start()
+
+def auto_start_net_saturday():
+    with app.app_context():
+        if Net.query.filter_by(status='active').first(): return
+        name = f"Worldwide TG{Config.NET_AUTOMATIC_TG} Net - {datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M IST')}"
+        success, message = tune_tg_radio(Config.NET_AUTOMATIC_TG)
+        if not success: db.session.add(Event(event_type='scheduler', message=f'TG91 auto-start tune failed: {message}', severity='error')); db.session.commit(); return
+        db.session.add(Net(name=name, status='active', talkgroup=Config.NET_AUTOMATIC_TG, start_time=utcnow())); db.session.add(Event(event_type='scheduler', message=f"Automated net session '{name}' initiated", severity='info')); db.session.commit()
+
+def build_adif(checkins):
+    output = io.StringIO(); output.write('DMR DVSwitch BrandMeister NCS Station platform generated ADIF\n'); output.write(adif_field('ADIF_VER','3.1.4') + adif_field('PROGRAMID','DMRNCSCONSOLE') + '<EOH>\n\n')
+    for c in checkins:
+        start = c.join_time or c.timestamp; end = c.last_heard_time or c.timestamp; comment = f'TG{c.net.talkgroup} check-in #{c.number}' if c.net else f'Check-in #{c.number}'
+        for name, value in [('CALL', c.callsign.upper()), ('QSO_DATE', start.strftime('%Y%m%d')), ('TIME_ON', start.strftime('%H%M%S')), ('TIME_OFF', end.strftime('%H%M%S')), ('MODE','DIGITALVOICE'), ('SUBMODE','DMR'), ('COMMENT', comment), ('APP_DVSWITCH_DMR_ID', c.dmr_id), ('NAME', c.name or ''), ('COUNTRY', c.country or '')]:
+            if value: output.write(adif_field(name, value))
+        output.write('<EOR>\n')
+    return output.getvalue()
+
+def generate_net_adif_file(net):
+    os.makedirs(Config.EXPORT_DIR, exist_ok=True); path = os.path.join(Config.EXPORT_DIR, f'net_{net.id}_tg{net.talkgroup}_{utcnow().strftime("%Y%m%d_%H%M%S")}.adi')
+    with open(path, 'w', encoding='utf-8') as fh: fh.write(build_adif(CheckIn.query.filter_by(net_id=net.id).all()))
+    db.session.add(Report(net_id=net.id, title=f'{net.name} ADIF', format='ADIF', path=path)); return path
+
+def auto_close_net_sunday():
+    with app.app_context():
+        active_net = Net.query.filter_by(status='active', talkgroup=Config.NET_AUTOMATIC_TG).first()
+        if not active_net: return
+        active_net.status = 'stopped'; active_net.end_time = utcnow(); active_net.duration = int((active_net.end_time - active_net.start_time).total_seconds()/60); active_net.participant_count = active_net.checkins.count(); active_net.country_count = len({c.country for c in active_net.checkins.all() if c.country}); generate_net_adif_file(active_net); active_net.archived = True; db.session.add(Event(event_type='scheduler', message=f"Automated net session '{active_net.name}' archived", severity='info')); db.session.commit()
+
+def service_statuses(): return {service: systemd_status(unit) for service, unit in Config.SYSTEMD_UNITS.items()}
 
 # Start APScheduler with native cron automation triggers
 scheduler = BackgroundScheduler()
-scheduler.add_job(parse_mmdvm_logs_job, 'interval', seconds=5)
+scheduler.add_job(parse_radio_logs_job, 'interval', seconds=5)
 
 # Strictly trigger on Saturdays 21:30 IST and Sunday 03:00 IST directly via scheduler definitions
-scheduler.add_job(auto_start_net_saturday, 'cron', day_of_week='sat', hour=21, minute=30, timezone=IST)
-scheduler.add_job(auto_close_net_sunday, 'cron', day_of_week='sun', hour=3, minute=0, timezone=IST)
+scheduler.add_job(auto_start_net_saturday, 'cron', day_of_week='sat', hour=Config.NET_START_HOUR, minute=Config.NET_START_MINUTE, timezone=IST)
+scheduler.add_job(auto_close_net_sunday, 'cron', day_of_week='sun', hour=Config.NET_CLOSE_HOUR, minute=Config.NET_CLOSE_MINUTE, timezone=IST)
 
 scheduler.start()
 start_aprs_is_listener()
@@ -529,170 +411,176 @@ start_aprs_is_listener()
 # 1. Dashboard Status API
 @app.route('/api/status', methods=['GET'])
 def get_system_status():
-    # Retrieve current active talkgroup from info json
-    tg = 91
-    call = "VU3EFZ"
-    dmr_id = "4040444"
-    rpt_id = "404044418"
-    
-    if os.path.exists(Config.AB_INFO_FILE):
-        try:
-            with open(Config.AB_INFO_FILE, 'r') as f:
-                ab_data = json.load(f)
-                tg = int(ab_data["digital"].get("tg", 91))
-                call = ab_data["digital"].get("call", "VU3EFZ")
-                dmr_id = ab_data["digital"].get("gw", "4040444")
-                rpt_id = ab_data["digital"].get("rpt", "404044418")
-        except Exception:
-            pass
-
-    # Retrieve current CPU, Ram, Disk usage
+    ab_info = get_ab_info()
     cpu = psutil.cpu_percent()
     ram = psutil.virtual_memory().percent
     disk = psutil.disk_usage('/').percent
-    
-    # Calculate Uptime
-    uptime_seconds = int(psutil.boot_time())
-    now = int(datetime.datetime.now().timestamp())
-    diff = now - uptime_seconds
-    days = diff // 86400
-    hours = (diff % 86400) // 3600
-    minutes = (diff % 3600) // 60
-    uptime_str = f"{days}d {hours}h {minutes}m"
-
-    # Services statuses
-    # In real EC2 environment we check active systemd processes:
-    services = {
-        "analogBridge": "running",
-        "mmdvmBridge": "running",
-        "apache": "running",
-        "gunicorn": "running",
-        "dvswitch": "running"
-    }
-
-    # Brandmeister state
-    brandmeister = "online"
+    diff = int(datetime.datetime.now().timestamp()) - int(psutil.boot_time())
+    uptime_str = f"{diff // 86400}d {(diff % 86400) // 3600}h {(diff % 3600) // 60}m"
+    try:
+        fetch_brandmeister_json(Config.BRANDMEISTER_MASTERS_URL)
+        brandmeister = "online"
+    except requests.RequestException:
+        brandmeister = "degraded"
     active_net = Net.query.filter_by(status='active').first()
-    
     return jsonify({
-        "current_tg": tg,
-        "current_callsign": call,
-        "current_dmr_id": dmr_id,
-        "current_repeater_id": rpt_id,
+        "current_tg": ab_info["tg"],
+        "current_callsign": ab_info["call"],
+        "current_dmr_id": ab_info["gw"],
+        "current_repeater_id": ab_info["rpt"],
         "brandmeister_status": brandmeister,
         "cpu_usage": cpu,
         "ram_usage": ram,
         "disk_usage": disk,
         "uptime": uptime_str,
-        "server_public_ip": "15.206.12.84",
+        "server_public_ip": Config.SERVER_PUBLIC_IP,
+        "last_tune_time": TalkgroupRecent.query.order_by(TalkgroupRecent.tuned_at.desc()).first().tuned_at.isoformat() if TalkgroupRecent.query.first() else None,
         "net_active": active_net is not None,
         "active_net": {
+            "id": active_net.id,
             "name": active_net.name,
             "talkgroup": active_net.talkgroup,
             "participants": active_net.participant_count,
             "countries": active_net.country_count
         } if active_net else None,
-        "services": services
+        "services": service_statuses()
     })
 
-# 2. Talkgroup API - Query/Search and Switch TG (Admin Only)
+# 2. Talkgroup API - Directory, Search, Favorites, Recents and Tune Controls
 @app.route('/talkgroups', methods=['GET'])
 def get_talkgroups_html():
     countries = db.session.query(Talkgroup.country).distinct().all()
     categories = db.session.query(Talkgroup.category).distinct().all()
     languages = db.session.query(Talkgroup.language).distinct().all()
     regions = db.session.query(Talkgroup.region).distinct().all()
-    
-    countries_list = sorted([c[0] for c in countries if c[0]])
-    categories_list = sorted([c[0] for c in categories if c[0]])
-    languages_list = sorted([l[0] for l in languages if l[0]])
-    regions_list = sorted([r[0] for r in regions if r[0]])
-    
-    all_tgs = Talkgroup.query.all()
-    
-    current_tg = 91
-    if os.path.exists(Config.AB_INFO_FILE):
-        try:
-            with open(Config.AB_INFO_FILE, 'r') as f:
-                ab_data = json.load(f)
-                current_tg = int(ab_data["digital"].get("tg", 91))
-        except Exception:
-            pass
-            
     return render_template(
         'talkgroups.html',
-        talkgroups=all_tgs,
-        countries=countries_list,
-        categories=categories_list,
-        languages=languages_list,
-        regions=regions_list,
-        current_tg=current_tg
+        talkgroups=Talkgroup.query.order_by(Talkgroup.number.asc()).all(),
+        countries=sorted([c[0] for c in countries if c[0]]),
+        categories=sorted([c[0] for c in categories if c[0]]),
+        languages=sorted([l[0] for l in languages if l[0]]),
+        regions=sorted([r[0] for r in regions if r[0]]),
+        current_tg=get_ab_info()["tg"],
     )
+
+def serialize_talkgroup(tg):
+    return {"number": tg.number, "name": tg.name, "country": tg.country, "description": tg.description, "category": tg.category, "language": tg.language, "region": tg.region, "source": tg.source}
+
+def talkgroup_query_from_request():
+    q = sanitize(request.args.get('q', ''), 120)
+    query = Talkgroup.query
+    if q:
+        like = f"%{q}%"
+        query = query.filter(
+            db.or_(
+                Talkgroup.number.cast(db.String).like(like),
+                Talkgroup.name.like(like),
+                Talkgroup.country.like(like),
+                Talkgroup.language.like(like),
+                Talkgroup.description.like(like),
+            )
+        )
+    for attr in ['country', 'language', 'region', 'category']:
+        value = sanitize(request.args.get(attr, ''), 100)
+        if value:
+            query = query.filter(getattr(Talkgroup, attr) == value)
+    return query.order_by(Talkgroup.number.asc())
 
 @app.route('/api/talkgroups', methods=['GET'])
 def get_talkgroups():
-    q = request.args.get('q', '')
-    if q:
-        tgs = Talkgroup.query.filter(
-            (Talkgroup.number.like(f"%{q}%")) |
-            (Talkgroup.name.like(f"%{q}%")) |
-            (Talkgroup.country.like(f"%{q}%")) |
-            (Talkgroup.region.like(f"%{q}%"))
-        ).all()
-    else:
-        tgs = Talkgroup.query.all()
-        
-    return jsonify([{
-        "number": tg.number,
-        "name": tg.name,
-        "country": tg.country,
-        "description": tg.description,
-        "category": tg.category,
-        "language": tg.language,
-        "region": tg.region
-    } for tg in tgs])
+    return jsonify([serialize_talkgroup(tg) for tg in talkgroup_query_from_request().limit(2000).all()])
+
+@app.route('/api/talkgroups/search', methods=['GET'])
+def search_talkgroups():
+    return get_talkgroups()
+
+@app.route('/api/talkgroups/sync', methods=['POST'])
+@login_required
+def sync_talkgroups_api():
+    if not (current_user.has_role('Admin') or current_user.has_role('Operator')):
+        return jsonify({"error": "Operator access required"}), 403
+    try:
+        count = sync_brandmeister_talkgroups()
+        log_audit_action('BrandMeister talkgroup sync', target=Config.BRANDMEISTER_TALKGROUP_URL, status='success')
+        return jsonify({"success": True, "count": count})
+    except requests.RequestException as exc:
+        log_audit_action('BrandMeister talkgroup sync', target=Config.BRANDMEISTER_TALKGROUP_URL, status='failed')
+        return jsonify({"error": str(exc)}), 502
+
+@app.route('/api/talkgroups/favorites', methods=['GET', 'POST', 'DELETE'])
+@login_required
+def talkgroup_favorites():
+    if request.method == 'GET':
+        favorites = TalkgroupFavorite.query.order_by(TalkgroupFavorite.created_at.desc()).all()
+        return jsonify([{"talkgroup": f.talkgroup, "label": f.label, "createdAt": f.created_at.isoformat()} for f in favorites])
+    data = request.json or {}
+    tg = parse_int(data.get('talkgroup'))
+    if not tg:
+        return jsonify({"error": "Invalid talkgroup"}), 400
+    if request.method == 'POST':
+        fav = TalkgroupFavorite.query.filter_by(talkgroup=tg).first() or TalkgroupFavorite(talkgroup=tg)
+        fav.label = sanitize(data.get('label'), 120) or fav.label
+        db.session.merge(fav); db.session.commit()
+        log_audit_action('Favorite talkgroup', target=f'TG {tg}', status='success')
+        return jsonify({"success": True})
+    TalkgroupFavorite.query.filter_by(talkgroup=tg).delete(); db.session.commit()
+    log_audit_action('Unfavorite talkgroup', target=f'TG {tg}', status='success')
+    return jsonify({"success": True})
+
+@app.route('/api/talkgroups/recent', methods=['GET'])
+def talkgroup_recent():
+    rows = TalkgroupRecent.query.order_by(TalkgroupRecent.tuned_at.desc()).limit(25).all()
+    return jsonify([{"talkgroup": r.talkgroup, "action": r.action, "tunedAt": r.tuned_at.isoformat()} for r in rows])
 
 @app.route('/api/talkgroup/tune', methods=['POST'])
 @login_required
 def tune_talkgroup():
     if not current_user.has_role("Admin"):
         return jsonify({"error": "Unauthorized permission check failed"}), 403
-        
-    data = request.json or {}
-    tg = data.get('tg')
+    tg = parse_int((request.json or {}).get('tg'))
     if not tg:
         return jsonify({"error": "Invalid talkgroup target specified"}), 400
-        
-    success = tune_tg_radio(tg)
-    if success:
-        log_audit_action(action=f"Tune talkgroup to {tg}", target=f"TG {tg}", status="success")
-        return jsonify({"success": True, "message": f"Successfully tuned station gateway to Talkgroup {tg}"})
-    else:
-        log_audit_action(action=f"Tune talkgroup to {tg}", target=f"TG {tg}", status="failed")
-        return jsonify({"error": "Failed executing hardware tuning daemon script"}), 500
+    success, message = tune_tg_radio(tg)
+    log_audit_action(action=f"Tune talkgroup to {tg}", target=f"TG {tg}", status="success" if success else "failed")
+    if not success:
+        return jsonify({"error": message}), 500
+    return jsonify({"success": True, "message": message})
+
+@app.route('/api/talkgroup/disconnect', methods=['POST'])
+@login_required
+def disconnect_talkgroup_api():
+    if not current_user.has_role("Admin"):
+        return jsonify({"error": "Unauthorized permission check failed"}), 403
+    success, message = disconnect_talkgroup()
+    log_audit_action(action="Disconnect talkgroup", target="DVSwitch", status="success" if success else "failed")
+    if not success:
+        return jsonify({"error": message}), 500
+    return jsonify({"success": True, "message": message})
 
 # 3. Live Heard Logs and Stations Search API
 @app.route('/api/heard', methods=['GET'])
 def get_heard_stations():
-    search = request.args.get('search', '')
+    search = sanitize(request.args.get('search', ''), 120)
     tg = request.args.get('tg', '')
-    
+    since = request.args.get('range', 'day')
     query = Heard.query
     if search:
-        query = query.filter(
-            (Heard.callsign.like(f"%{search}%")) |
-            (Heard.dmr_id.like(f"%{search}%")) |
-            (Heard.country.like(f"%{search}%"))
-        )
-    if tg:
-        query = query.filter_by(talkgroup=int(tg))
-        
-    records = query.order_by(Heard.last_heard.desc()).all()
+        like = f"%{search}%"
+        query = query.filter(db.or_(Heard.callsign.like(like), Heard.dmr_id.like(like), Heard.country.like(like), Heard.name.like(like), Heard.city.like(like)))
+    parsed_tg = parse_int(tg) if tg else None
+    if parsed_tg:
+        query = query.filter_by(talkgroup=parsed_tg)
+    cutoff_map = {'hour': datetime.timedelta(hours=1), 'day': datetime.timedelta(days=1), 'week': datetime.timedelta(days=7), 'month': datetime.timedelta(days=31)}
+    if since in cutoff_map:
+        query = query.filter(Heard.last_heard >= utcnow() - cutoff_map[since])
+    records = query.order_by(Heard.last_heard.desc()).limit(1000).all()
     return jsonify([{
         "id": r.id,
         "callsign": r.callsign,
         "dmrId": r.dmr_id,
-        "country": r.country or "Global DX Prefix",
+        "name": r.name,
+        "city": r.city,
+        "country": r.country,
         "talkgroup": r.talkgroup,
         "firstHeard": r.first_heard.isoformat() if r.first_heard else "",
         "lastHeard": r.last_heard.isoformat() if r.last_heard else "",
@@ -700,6 +588,19 @@ def get_heard_stations():
         "airtime": r.airtime,
         "netParticipation": r.net_participation
     } for r in records])
+
+@app.route('/api/heard/history', methods=['GET'])
+def get_heard_history():
+    since = request.args.get('range', 'day')
+    query = HeardHistory.query
+    cutoff_map = {'hour': datetime.timedelta(hours=1), 'day': datetime.timedelta(days=1), 'week': datetime.timedelta(days=7), 'month': datetime.timedelta(days=31)}
+    if since in cutoff_map:
+        query = query.filter(HeardHistory.started_at >= utcnow() - cutoff_map[since])
+    tg = parse_int(request.args.get('tg')) if request.args.get('tg') else None
+    if tg:
+        query = query.filter_by(talkgroup=tg)
+    rows = query.order_by(HeardHistory.started_at.desc()).limit(2000).all()
+    return jsonify([{"id": r.id, "source": r.source, "callsign": r.callsign, "dmrId": r.dmr_id, "name": r.name, "city": r.city, "country": r.country, "talkgroup": r.talkgroup, "timestamp": r.started_at.isoformat(), "duration": r.duration} for r in rows])
 
 # 4. Net Session Management Dashboard API (Audit/Controls)
 @app.route('/api/nets', methods=['GET'])
@@ -747,16 +648,16 @@ def control_net_session():
         db.session.add(net)
         db.session.commit()
         
-        tune_tg_radio(tg)
-        log_audit_action("Start Net", name, "success")
-        return jsonify({"success": True, "message": f"NCS Net '{name}' initialized. TG {tg} configured."})
+        tune_success, tune_message = tune_tg_radio(tg)
+        log_audit_action("Start Net", name, "success" if tune_success else "failed")
+        return jsonify({"success": tune_success, "message": f"NCS Net '{name}' initialized. {tune_message}"}), (200 if tune_success else 500)
         
     elif action == 'stop':
         active = Net.query.filter_by(status='active').first()
         if not active:
             return jsonify({"error": "No active Net in session to terminate"}), 400
             
-        active.status = 'closed'
+        active.status = 'stopped'
         active.end_time = datetime.datetime.utcnow()
         if active.start_time:
             td = active.end_time - active.start_time
@@ -787,7 +688,7 @@ def control_net_session():
 def get_net_checkins():
     active_net = Net.query.filter_by(status='active').first()
     if not active_net:
-        # Fallback to last closed net to prevent empty projections
+        # Fallback to last stopped net to prevent empty projections
         active_net = Net.query.filter(Net.status != 'scheduled').order_by(Net.start_time.desc()).first()
         
     if not active_net:
@@ -810,147 +711,235 @@ def get_net_checkins():
         } for c in checkins]
     })
 
+
+@app.route('/api/checkins/add', methods=['POST'])
+@login_required
+def add_checkin():
+    if not (current_user.has_role('Admin') or current_user.has_role('Operator')):
+        return jsonify({"error": "Operator access required"}), 403
+    active_net = Net.query.filter_by(status='active').first()
+    if not active_net:
+        return jsonify({"error": "No active net session"}), 400
+    data = request.json or {}
+    callsign = sanitize(data.get('callsign'), 30).upper()
+    if not re.match(r'^[A-Z0-9/]{3,15}$', callsign):
+        return jsonify({"error": "Invalid callsign"}), 400
+    metadata = lookup_radio_metadata(callsign=callsign)
+    dmr_id = sanitize(data.get('dmrId') or metadata.get('dmr_id'), 30)
+    if not re.match(r'^\d{4,10}$', dmr_id):
+        return jsonify({"error": "Valid DMR ID is required or callsign must resolve via RadioID"}), 400
+    if CheckIn.query.filter_by(net_id=active_net.id, dmr_id=dmr_id).first() or CheckIn.query.filter_by(net_id=active_net.id, callsign=callsign).first():
+        return jsonify({"error": "Station already checked in"}), 409
+    checkin = CheckIn(
+        net_id=active_net.id,
+        number=active_net.checkins.count() + 1,
+        callsign=callsign,
+        dmr_id=dmr_id,
+        name=sanitize(data.get('name') or metadata.get('name'), 120),
+        city=sanitize(data.get('city') or metadata.get('city'), 100),
+        country=sanitize(data.get('country') or metadata.get('country'), 100) or 'Unknown',
+        timestamp=utcnow(),
+        join_time=utcnow(),
+        last_heard_time=utcnow(),
+        signal_report=sanitize(data.get('signalReport') or '59', 10),
+        validated=True,
+        late_checkin=utcnow() > (active_net.start_time + datetime.timedelta(minutes=30)),
+    )
+    db.session.add(checkin)
+    active_net.participant_count = active_net.checkins.count() + 1
+    db.session.commit()
+    active_net.country_count = len({c.country for c in active_net.checkins.all() if c.country})
+    db.session.commit()
+    log_audit_action('Manual check-in added', callsign, 'success')
+    return jsonify({"success": True, "checkin": {"number": checkin.number, "callsign": checkin.callsign, "dmrId": checkin.dmr_id}})
+
+@app.route('/api/checkins/validate', methods=['POST'])
+@login_required
+def validate_checkin():
+    if not (current_user.has_role('Admin') or current_user.has_role('Operator')):
+        return jsonify({"error": "Operator access required"}), 403
+    data = request.json or {}
+    net_id = parse_int(data.get('net_id'))
+    number = parse_int(data.get('number'))
+    checkin = CheckIn.query.filter_by(net_id=net_id, number=number).first() if net_id and number else None
+    if not checkin:
+        return jsonify({"error": "Check-in not found"}), 404
+    checkin.validated = not checkin.validated
+    db.session.commit()
+    log_audit_action('Toggle check-in validation', f'{checkin.callsign} #{checkin.number}', 'success')
+    return jsonify({"success": True, "validated": checkin.validated})
+
+@app.route('/api/checkins/delete', methods=['POST'])
+@login_required
+def delete_checkin():
+    if not current_user.has_role('Admin'):
+        return jsonify({"error": "Admin access required"}), 403
+    data = request.json or {}
+    net_id = parse_int(data.get('net_id'))
+    number = parse_int(data.get('number'))
+    checkin = CheckIn.query.filter_by(net_id=net_id, number=number).first() if net_id and number else None
+    if not checkin:
+        return jsonify({"error": "Check-in not found"}), 404
+    net = checkin.net
+    db.session.delete(checkin); db.session.flush()
+    for idx, row in enumerate(CheckIn.query.filter_by(net_id=net.id).order_by(CheckIn.number.asc()).all(), start=1):
+        row.number = idx
+    net.participant_count = net.checkins.count(); net.country_count = len({c.country for c in net.checkins.all() if c.country})
+    db.session.commit()
+    log_audit_action('Delete check-in', f'{net.name} #{number}', 'success')
+    return jsonify({"success": True})
+
 # 6. Service Controls Dashboard Action (Admin Systemctl Operations)
 @app.route('/api/services/control', methods=['POST'])
 @login_required
 def service_control():
     if not current_user.has_role("Admin"):
         return jsonify({"error": "Unauthorized permission check failed"}), 403
-        
     data = request.json or {}
-    service = data.get('service') # analogBridge, mmdvmBridge, apache, gunicorn, dvswitch, system_reboot, system_shutdown
-    action = data.get('action') # restart, stop, start
-    
-    cmd_mapping = {
-        "analogBridge": f"sudo systemctl {action} analog_bridge",
-        "mmdvmBridge": f"sudo systemctl {action} mmdvm_bridge",
-        "apache": f"sudo systemctl {action} apache2",
-        "gunicorn": f"sudo systemctl {action} dvs-admin",
-        "dvswitch": f"sudo systemctl {action} dvswitch",
-        "system_reboot": "sudo reboot",
-        "system_shutdown": "sudo shutdown -h now"
-    }
-    
-    command = cmd_mapping.get(service)
-    if not command:
-        return jsonify({"error": "Requested invalid system service name"}), 400
-        
-    try:
-        # In actual AWS production environment we run the real system commands safely:
-        # res = subprocess.run(command.split(), check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        # return_msg = res.stdout.decode() or f"{service} state successfully changed to {action}"
-        
-        # Simulating outputs for UI Console
-        return_msg = f"System Command Executed: '{command}'\nOutput: [SYSTEMCTL SUCCESS] - Service {service} state changed to {action} successfully.\nLog details generated."
-        log_audit_action(f"Service Control: {action} {service}", target=service, status="success")
-        return jsonify({"success": True, "console_output": return_msg})
-    except Exception as e:
-        log_audit_action(f"Service Control: {action} {service}", target=service, status="failed")
-        return jsonify({"error": f"Failed service execution command: {str(e)}"}), 500
+    service = sanitize(data.get('service'), 40)
+    action = sanitize(data.get('action'), 20)
+    if service == 'system_reboot':
+        ok, output = control_systemd_service('gunicorn', 'restart') if os.environ.get('ENABLE_HOST_REBOOT') != 'true' else (subprocess.run(['sudo', 'reboot'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5).returncode == 0, 'reboot requested')
+    else:
+        ok, output = control_systemd_service(service, action)
+    log_audit_action(f"Service Control: {action} {service}", target=service, status="success" if ok else "failed")
+    if not ok:
+        return jsonify({"error": output}), 500
+    return jsonify({"success": True, "console_output": output, "services": service_statuses()})
 
-# 7. EXPORTS: ADIF, CSV, PDF Report Generator API
+# 7. EXPORTS: ADIF and CSV
+
+def filtered_checkin_query():
+    query = CheckIn.query.join(Net)
+    net_id = request.args.get('net_id')
+    if net_id:
+        parsed = parse_int(net_id)
+        if parsed:
+            query = query.filter(CheckIn.net_id == parsed)
+    station = sanitize(request.args.get('station', ''), 30).upper()
+    if station:
+        query = query.filter(CheckIn.callsign == station)
+    tg = parse_int(request.args.get('talkgroup')) if request.args.get('talkgroup') else None
+    if tg:
+        query = query.filter(Net.talkgroup == tg)
+    date_from = request.args.get('date_from')
+    date_to = request.args.get('date_to')
+    if date_from:
+        query = query.filter(CheckIn.timestamp >= datetime.datetime.fromisoformat(date_from))
+    if date_to:
+        query = query.filter(CheckIn.timestamp <= datetime.datetime.fromisoformat(date_to) + datetime.timedelta(days=1))
+    return query.order_by(CheckIn.timestamp.asc())
+
+def validate_adif_checkins(checkins):
+    errors = []
+    for c in checkins:
+        if not re.match(r'^[A-Z0-9/]{3,15}$', c.callsign or ''):
+            errors.append(f'Check-in {c.id}: invalid CALL')
+        if not re.match(r'^\d{4,10}$', c.dmr_id or ''):
+            errors.append(f'Check-in {c.id}: invalid DMR ID')
+        if not c.timestamp:
+            errors.append(f'Check-in {c.id}: missing timestamp')
+    return errors
+
+@app.route('/api/exports/adif/validate', methods=['GET'])
+def validate_adif_export():
+    checkins = filtered_checkin_query().all()
+    errors = validate_adif_checkins(checkins)
+    return jsonify({"valid": not errors, "errors": errors, "qso_count": len(checkins)})
+
 @app.route('/api/exports/adif', methods=['GET'])
 def export_adif():
-    net_id = request.args.get('net_id')
-    query = CheckIn.query
-    if net_id:
-        query = query.filter_by(net_id=int(net_id))
-    checkins = query.all()
-    
-    output = io.StringIO()
-    output.write("DMR DVSwitch BrandMeister NCS Station platform generated ADIF\n")
-    output.write("<ADIF_VER:5>3.1.4\n")
-    output.write("<PROGRAMID:13>DMRNCSCONSOLE\n")
-    output.write("<EOH>\n\n")
-    
-    for c in checkins:
-        # Generate valid Amateur Radio ADIF record
-        date_str = c.timestamp.strftime("%Y%m%d")
-        time_str = c.timestamp.strftime("%H%M%S")
-        tg_num = 91
-        try:
-            tg_num = c.net.talkgroup
-        except Exception:
-            pass
-            
-        record = f"<CALL:{len(c.callsign)}>{c.callsign} "
-        record += f"<MODE:3>DMR "
-        record += f"<QSO_DATE:{len(date_str)}>{date_str} "
-        record += f"<TIME_ON:{len(time_str)}>{time_str} "
-        record += f"<COMMENT:{len(f'TG{tg_num} checkin #{c.number}')}>{f'TG{tg_num} checkin #{c.number}'} "
-        record += f"<BAND:3>70C "
-        record += f"<DMR_ID:{len(c.dmr_id)}>{c.dmr_id} "
-        record += "<EOR>\n"
-        output.write(record)
-        
+    checkins = filtered_checkin_query().all()
+    errors = validate_adif_checkins(checkins)
+    if errors:
+        return jsonify({"error": "ADIF validation failed", "errors": errors}), 422
     mem = io.BytesIO()
-    mem.write(output.getvalue().encode('utf-8'))
+    mem.write(build_adif([c for c in checkins if c.validated]).encode('utf-8'))
     mem.seek(0)
-    return send_file(
-        mem,
-        mimetype="text/plain",
-        as_attachment=True,
-        download_name=f"dmr_ncs_log_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.adi"
-    )
+    return send_file(mem, mimetype="text/plain", as_attachment=True, download_name=f"dmr_ncs_log_{utcnow().strftime('%Y%m%d_%H%M%S')}.adi")
 
 @app.route('/api/exports/csv', methods=['GET'])
 def export_csv():
-    net_id = request.args.get('net_id')
-    query = CheckIn.query
-    if net_id:
-        query = query.filter_by(net_id=int(net_id))
-    checkins = query.all()
-    
+    checkins = filtered_checkin_query().all()
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Checkin No", "Callsign", "DMR ID", "Country", "Timestamp", "Signal Report", "Verified"])
-    
+    writer.writerow(["Checkin No", "Callsign", "DMR ID", "Name", "City", "Country", "Join Time", "Last Heard", "Signal Report", "Verified", "Late"])
     for c in checkins:
-        writer.writerow([
-            c.number,
-            c.callsign,
-            c.dmr_id,
-            c.country,
-            c.timestamp.isoformat(),
-            c.signal_report,
-            "YES" if c.validated else "NO"
-        ])
-        
-    mem = io.BytesIO()
-    mem.write(output.getvalue().encode('utf-8'))
-    mem.seek(0)
-    return send_file(
-        mem,
-        mimetype="text/csv",
-        as_attachment=True,
-        download_name=f"ncs_checkins_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M')}.csv"
-    )
+        writer.writerow([c.number, c.callsign, c.dmr_id, c.name or '', c.city or '', c.country, (c.join_time or c.timestamp).isoformat(), (c.last_heard_time or c.timestamp).isoformat(), c.signal_report, "YES" if c.validated else "NO", "YES" if c.late_checkin else "NO"])
+    mem = io.BytesIO(); mem.write(output.getvalue().encode('utf-8')); mem.seek(0)
+    return send_file(mem, mimetype="text/csv", as_attachment=True, download_name=f"ncs_checkins_{utcnow().strftime('%Y%m%d_%H%M')}.csv")
+
+def compute_country_stats():
+    rows = {}
+    for station in Station.query.all():
+        item = rows.setdefault(station.country or 'Unknown', {"country": station.country or 'Unknown', "stations": 0, "transmissions": 0, "airtime": 0, "checkins": 0})
+        item["stations"] += 1
+        item["transmissions"] += station.total_tx or 0
+        item["airtime"] += station.total_airtime or 0
+    for checkin in CheckIn.query.all():
+        item = rows.setdefault(checkin.country or 'Unknown', {"country": checkin.country or 'Unknown', "stations": 0, "transmissions": 0, "airtime": 0, "checkins": 0})
+        item["checkins"] += 1
+    return sorted(rows.values(), key=lambda r: (r['checkins'], r['transmissions']), reverse=True)
+
+@app.route('/api/stats/countries', methods=['GET'])
+def country_stats():
+    return jsonify(compute_country_stats())
+
+@app.route('/api/ncs/dashboard', methods=['GET'])
+def ncs_dashboard():
+    active = Net.query.filter_by(status='active').first()
+    recent_heard = Heard.query.order_by(Heard.last_heard.desc()).limit(10).all()
+    top_tgs = db.session.query(Heard.talkgroup, db.func.sum(Heard.tx_count)).group_by(Heard.talkgroup).order_by(db.func.sum(Heard.tx_count).desc()).limit(10).all()
+    return jsonify({
+        "activeNet": {"id": active.id, "name": active.name, "talkgroup": active.talkgroup, "checkins": active.checkins.count(), "countries": active.country_count} if active else None,
+        "newStations": [{"callsign": h.callsign, "dmrId": h.dmr_id, "country": h.country, "talkgroup": h.talkgroup, "lastHeard": h.last_heard.isoformat()} for h in recent_heard],
+        "countries": compute_country_stats(),
+        "topTalkgroups": [{"talkgroup": tg, "transmissions": int(count or 0)} for tg, count in top_tgs],
+        "activeOperators": [u.username for u in User.query.filter_by(active=True).all()],
+    })
+
+@app.route('/api/brandmeister/lastheard', methods=['GET'])
+def brandmeister_lastheard():
+    try:
+        return jsonify(fetch_brandmeister_json(Config.BRANDMEISTER_LASTHEARD_URL, dict(request.args)))
+    except requests.RequestException as exc:
+        return jsonify({"error": str(exc)}), 502
+
+@app.route('/api/brandmeister/masters', methods=['GET'])
+def brandmeister_masters():
+    try:
+        return jsonify(fetch_brandmeister_json(Config.BRANDMEISTER_MASTERS_URL))
+    except requests.RequestException as exc:
+        return jsonify({"error": str(exc)}), 502
 
 # 8. Authentication HTML and Session Handling API
 @app.route('/api/auth/login', methods=['POST'])
 def process_login():
     data = request.json or {}
-    username = data.get('username')
+    username = sanitize(data.get('username'), 80).lower()
     password = data.get('password')
-    
     if not username or not password:
         return jsonify({"error": "Username and password details must be filled."}), 400
-        
     user = User.query.filter_by(username=username).first()
-    if not user or not user.check_password(password):
-        # Audit failed login
+    if user and user.locked_until and user.locked_until > utcnow():
+        log_audit_action("User login locked", f"User {username}", "failed", username=username)
+        return jsonify({"error": "Account temporarily locked after failed login attempts."}), 423
+    if not user or not user.active or not user.check_password(password):
+        if user:
+            user.failed_logins = (user.failed_logins or 0) + 1
+            if user.failed_logins >= 5:
+                user.locked_until = utcnow() + datetime.timedelta(minutes=15)
+            db.session.commit()
         log_audit_action("User login failed", f"User {username}", "failed", username=username)
         return jsonify({"error": "Incorrect password or username details. Please try again."}), 401
-        
-    login_user(user, remember=True)
-    log_audit_action("User login successful", f"User logged in", "success", username=username)
-    
-    return jsonify({
-        "success": True,
-        "username": user.username,
-        "roles": [role.name for role in user.roles],
-        "message": "Logged in successfully to admin panel."
-    })
+    user.failed_logins = 0
+    user.locked_until = None
+    user.last_login_at = utcnow()
+    db.session.commit()
+    session.permanent = True
+    login_user(user, remember=False)
+    log_audit_action("User login successful", "User logged in", "success", username=username)
+    return jsonify({"success": True, "username": user.username, "roles": [role.name for role in user.roles], "message": "Logged in successfully to admin panel."})
 
 @app.route('/api/auth/logout', methods=['POST'])
 @login_required
@@ -969,38 +958,12 @@ def get_current_session():
         })
     return jsonify({"is_logged_in": False, "username": "anonymous", "roles": ["ReadOnly"]})
 
-# APRS Packet Simulation/Telemetry Feeds API
+# APRS Packet Telemetry API
 @app.route('/api/aprs', methods=['GET'])
 def get_aprs_beacons():
     packets = Aprs.query.order_by(Aprs.timestamp.desc()).limit(10).all()
-    # If database is completely empty let's return some simulated data
     if not packets:
-        return jsonify([
-            {
-                "id": "1",
-                "callsign": "VU3EFZ-9",
-                "timestamp": datetime.datetime.utcnow().isoformat(),
-                "latitude": 12.9716,
-                "longitude": 77.5946,
-                "altitude": 920.0,
-                "speed": 12.5,
-                "heading": 180,
-                "comment": "Mobile BrandMeister APRS Node",
-                "symbol": "/#"
-            },
-            {
-                "id": "2",
-                "callsign": "VU2DOR-7",
-                "timestamp": (datetime.datetime.utcnow() - datetime.timedelta(minutes=5)).isoformat(),
-                "latitude": 13.0827,
-                "longitude": 80.2707,
-                "altitude": 10.0,
-                "speed": 0.0,
-                "heading": 0,
-                "comment": "Brandmeister gateway tracker active",
-                "symbol": "[-]"
-            }
-        ])
+        return jsonify([])
     return jsonify([{
         "id": p.id,
         "callsign": p.callsign,
@@ -1014,6 +977,69 @@ def get_aprs_beacons():
         "symbol": p.symbol
     } for p in packets])
 
+
+
+@app.route('/api/stations', methods=['GET'])
+def stations_api():
+    rows = Station.query.order_by(Station.last_heard.desc()).limit(2000).all()
+    return jsonify([{"callsign": s.callsign, "dmrId": s.dmr_id, "name": s.name, "city": s.city, "country": s.country, "firstHeard": s.first_heard.isoformat() if s.first_heard else '', "lastHeard": s.last_heard.isoformat() if s.last_heard else '', "totalAirtime": s.total_airtime or 0, "totalTx": s.total_tx or 0, "totalNets": s.total_nets or 0, "mostUsedTg": s.most_used_tg} for s in rows])
+
+@app.route('/api/radioid/user', methods=['GET'])
+def radioid_user_api():
+    callsign = sanitize(request.args.get('callsign'), 30).upper() or None
+    dmr_id = sanitize(request.args.get('id'), 30) or None
+    record = lookup_radio_metadata(callsign=callsign, dmr_id=dmr_id)
+    if not record:
+        return jsonify({"error": "RadioID record not found"}), 404
+    return jsonify(record)
+
+@app.route('/api/logs', methods=['GET'])
+@login_required
+def api_logs():
+    if not (current_user.has_role('Admin') or current_user.has_role('Operator')):
+        return jsonify({"error": "Operator access required"}), 403
+    source = sanitize(request.args.get('type', 'mmdvm'), 40)
+    path = log_sources_for_today().get(source) or {'apache': '/var/log/apache2/error.log', 'system': '/var/log/syslog'}.get(source)
+    lines = parse_int(request.args.get('lines'), 1, 500) or 100
+    if not path or not os.path.exists(path):
+        return jsonify({"error": "Log file not available", "path": path}), 404
+    with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
+        content = fh.read().splitlines()[-lines:]
+    return '\n'.join(content), 200, {'Content-Type': 'text/plain; charset=utf-8'}
+
+@app.route('/api/audits', methods=['GET'])
+@login_required
+def audits_api():
+    if not current_user.has_role('Admin'):
+        return jsonify({"error": "Admin access required"}), 403
+    rows = AuditLog.query.order_by(AuditLog.timestamp.desc()).limit(500).all()
+    return jsonify([{"id": r.id, "timestamp": r.timestamp.isoformat(), "user": r.user, "role": r.role, "action": r.action, "target": r.target, "status": r.status, "ipAddress": r.ip_address} for r in rows])
+
+@app.route('/api/docs', methods=['GET'])
+def api_docs():
+    return jsonify({
+        "openapi": "3.1.0",
+        "info": {"title": "DVSwitch AWS NCS Appliance API", "version": "1.0.0"},
+        "paths": {
+            "/api/status": {"get": {"summary": "System, BrandMeister and service status"}},
+            "/api/talkgroups": {"get": {"summary": "Local talkgroup directory"}},
+            "/api/talkgroups/search": {"get": {"summary": "Search talkgroups by number/name/country/language/description"}},
+            "/api/talkgroups/sync": {"post": {"summary": "Synchronize BrandMeister talkgroups"}},
+            "/api/talkgroups/favorites": {"get": {}, "post": {}, "delete": {}},
+            "/api/talkgroups/recent": {"get": {}},
+            "/api/talkgroup/tune": {"post": {"summary": "Tune DVSwitch talkgroup"}},
+            "/api/talkgroup/disconnect": {"post": {"summary": "Disconnect DVSwitch talkgroup"}},
+            "/api/heard": {"get": {"summary": "Aggregated live heard"}},
+            "/api/heard/history": {"get": {"summary": "Transmission history"}},
+            "/api/aprs": {"get": {"summary": "Recent APRS-IS positions"}},
+            "/api/ncs/dashboard": {"get": {"summary": "NCS operator dashboard"}},
+            "/api/exports/adif": {"get": {"summary": "Validated ADIF export"}},
+            "/api/exports/adif/validate": {"get": {"summary": "ADIF validation"}},
+            "/api/services/control": {"post": {"summary": "systemd allow-list control"}},
+            "/api/audits": {"get": {"summary": "Audit log"}},
+        }
+    })
+
 if __name__ == '__main__':
     # Flask runner
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', '5000')), debug=False)

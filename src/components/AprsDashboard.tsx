@@ -54,7 +54,7 @@ export default function AprsDashboard() {
           className="inline-flex items-center gap-1.5 bg-white hover:bg-gray-50 border border-gray-200 px-3.5 py-2 rounded-lg text-xs font-semibold text-gray-700 transition shadow-sm cursor-pointer"
         >
           <RefreshCw className="w-3.5 h-3.5" />
-          Poll APRS.fi Socket
+          Poll APRS-IS Cache
         </button>
       </div>
 
@@ -65,7 +65,7 @@ export default function AprsDashboard() {
             APRS Visual Routing Canvas
           </h3>
           
-          {/* Simulated HUD map grid */}
+          {/* APRS HUD map grid */}
           <div className="bg-gray-950 rounded-xl h-72 border border-gray-800 relative overflow-hidden flex items-center justify-center">
             {/* Background scanner lines */}
             <div className="absolute inset-0 bg-[radial-gradient(#1e293b_1px,transparent_1px)] [background-size:16px_16px] opacity-40"></div>
@@ -98,7 +98,7 @@ export default function AprsDashboard() {
             })}
 
             <span className="absolute bottom-3 right-3 font-mono text-[9px] text-gray-500 bg-gray-900 border border-gray-800 px-2 py-0.5 rounded uppercase font-bold tracking-widest">
-              NCS Reference VU3EFZ-9 (Lock)
+              NCS Reference Station (Lock)
             </span>
           </div>
 

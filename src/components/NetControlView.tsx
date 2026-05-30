@@ -305,7 +305,7 @@ export default function NetControlView({ isLoggedIn, username }: NetControlViewP
                   required
                   value={callsign}
                   onChange={(e) => setCallsign(e.target.value.toUpperCase())}
-                  placeholder="e.g. VU3EFZ"
+                  placeholder="Enter callsign"
                   className="w-full border border-gray-200 rounded-lg px-3 py-2 text-xs font-bold font-mono uppercase focus:border-blue-500 outline-none"
                 />
               </div>
@@ -318,7 +318,7 @@ export default function NetControlView({ isLoggedIn, username }: NetControlViewP
                   type="text"
                   value={dmrId}
                   onChange={(e) => setDmrId(e.target.value)}
-                  placeholder="e.g. 4040444"
+                  placeholder="Enter DMR ID"
                   className="w-full border border-gray-200 rounded-lg px-3 py-2 text-xs font-mono focus:border-blue-500 outline-none"
                 />
               </div>

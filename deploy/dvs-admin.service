@@ -1,32 +1,23 @@
-# dvs-admin.service - Systemd service file for DMR NCS Platform
-# Place in /etc/systemd/system/dvs-admin.service and activate via:
-# sudo systemctl daemon-reload
-# sudo systemctl enable --now dvs-admin.service
-
 [Unit]
 Description=Gunicorn instance to serve DMR NCS Platform admin console
-After=network.target mmdvm_bridge.service analog_bridge.service apache2.service
+After=network-online.target apache2.service
+Wants=network-online.target
 
 [Service]
-User=root
-Group=root
+User=dmrncs
+Group=www-data
 WorkingDirectory=/opt/dmr_ncs_system
 Environment="PATH=/opt/dmr_ncs_system/venv/bin"
-Environment="SECRET_KEY=e83a903bd8d9aafe1030e5ef5dcece80e14fe052f582d921b77fac1518f9bd9a"
-Environment="DATABASE_URL=sqlite:////opt/dmr_ncs_system/dmr_control_station.db"
-
-# Expose Gunicorn listener on port 127.0.0.1:5000 inside the loopback
-ExecStart=/opt/dmr_ncs_system/venv/bin/gunicorn --workers 3 --bind 127.0.0.1:5000 --access-logfile /var/log/gunicorn/access.log --error-logfile /var/log/gunicorn/error.log --timeout 120 --keyfile /etc/letsencrypt/live/dvs.realneilbruce.in/privkey.pem --certfile /etc/letsencrypt/live/dvs.realneilbruce.in/fullchain.pem app:app
-
-# Auto start options and fault mitigation rules
+EnvironmentFile=/etc/dmr-ncs.env
+ExecStartPre=/opt/dmr_ncs_system/venv/bin/alembic -c /opt/dmr_ncs_system/alembic.ini upgrade head
+ExecStart=/opt/dmr_ncs_system/venv/bin/gunicorn --workers ${GUNICORN_WORKERS} --bind 127.0.0.1:${PORT} --access-logfile /var/log/gunicorn/access.log --error-logfile /var/log/gunicorn/error.log --timeout 120 app:app
 Restart=always
 RestartSec=5
 StartLimitIntervalSec=300
 StartLimitBurst=5
-
-# Sandboxing and security rules (for Ubuntu 24.04 LTS hardening)
 PrivateTmp=true
 ProtectSystem=full
+ReadWritePaths=/opt/dmr_ncs_system /var/log/gunicorn /var/log/mmdvm /tmp
 NoNewPrivileges=true
 
 [Install]
